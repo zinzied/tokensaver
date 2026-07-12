@@ -255,37 +255,48 @@ Open http://127.0.0.1:8200 in your browser for real-time monitoring of cache sta
 Run without subcommand to see the full interactive menu:
 
 ```
-  +============================================+
-  | OpenCode Token Saver CLI v8.0              |
-  | Compare · Compress · Cache · Proxy          |
-  +============================================+
+  +==================================================+
+  |  OpenCode Token Saver CLI v9.0              |
+  |  Compare - Compress - Cache - Proxy - Search     |
+  |  SQLite FTS5 index + MCP + Agent skills        |
+  +==================================================+
 
   Current Status
-    Model    : gpt-4o
-    Small    : gpt-4o-mini
+    Model    : MiMo V2 Pro Free
+    Small    : Ring 2.6 1T Free
     Compact  : auto=ON  prune=ON  reserved=10000
+    Save mode: free  max_paid=$5.0/M
 
   -- Menu --
 
-  1. Practical Saver (save-money)
-  2. Switch Main Model
-  3. Switch Small Model
-  4. Compare Models & Costs
-  5. Cost Projection
-   -- TOKEN REDUCTION --
-  6. Compress File
-  7. Compress Shell Output
-  8. Cache Stats / Clear Cache
-   -- GUARDRAILS --
-  9. Compression Proxy
-  10. Token Budget
-  11. Savings Report
-   -- SETTINGS --
-  12. Providers & API Status
-  13. Provider Health Check
-  14. Verify Config
-  15. Restore Backup
-  16. Exit
+     1. >>> ONE-CLICK AUTO SETUP <<<
+     2. Practical Saver (save-money)
+     -- COMPARE & PICK --
+     3. Compare Models & Costs
+     4. Switch Main Model
+     5. Switch Small Model
+     6. Model Heatmap
+     7. Cost Projection
+     -- COMPRESS --
+     8. Compress File Read
+     9. Compress Shell Output
+     10. Compress Batch Directory
+     11. Semantic AI Compress
+     -- CACHE --
+     12. Cache Stats / Clear
+     13. Content Store
+     14. Savings Ledger
+     -- PROXY --
+     15. Start Compression Proxy
+     16. Stop Proxy
+     17. Proxy Status
+     -- EXTRAS --
+     18. Providers & API Status
+     19. Provider Health Check
+     20. Token Budget Planner
+     21. Verify Config
+     22. Restore Backup
+     23. Exit
 ```
 
 ## Compression Benchmarks
