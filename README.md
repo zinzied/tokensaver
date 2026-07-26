@@ -1,8 +1,9 @@
-# Token Saver CLI v9.0
+# Token Saver CLI v9.5
 
 Reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress file reads and shell output, cache re-reads, run a request compression proxy, and track savings with a tamper-evident ledger. Now with **SQLite FTS5 search**, **MCP server**, and **agent skill installer**.
 
-**Inspired by [lean-ctx](https://github.com/yvgude/lean-ctx)** and [ctxrs/ctx](https://github.com/ctxrs/ctx) — context engineering + agent history search.
+**Inspired by [lean-ctx](https://github.com/yvgude/lean-ctx)** and [ctxrs/ctx](https://github.com/ctxrs/ctx) — context engineering + agent history search.  
+**Advanced features** (RTK compression, caveman mode, format translation, quota tracking, multi-account routing) draw on proven ideas from the open-source routing gateway ecosystem.
 
 ## Features
 
@@ -60,7 +61,52 @@ Reduce token waste and spending when using AI coding models. Compare pricing acr
 - **Self-verifying**: `savings verify` confirms ledger integrity
 - Per-entry tracking of raw tokens, compressed tokens, compression %
 
-### New in v9.0 (ctxrs/ctx inspired)
+### Advanced Token-Saving Features (v9.5)
+
+#### RTK Tool-Result Compression (token_filters.py)
+- **12 smart filters** that auto-detect and compress tool output before sending to the LLM
+- Covers: `git diff`, `git status`, `git log`, `grep`, `find`, `ls`, `tree`, build logs, duplicate lines, and more
+- **20-40% input token savings** on typical tool_result content
+- Auto-detects the right filter — no manual selector needed
+- Safe: falls back to raw text if compression would lose data
+
+#### Caveman / Ponytail Mode (token_prompts.py)
+- **Caveman Mode** — injects terse-output system prompts (6 levels: lite → ultra, including Wenyan classical Chinese)
+- **Ponytail Mode** — "lazy senior dev" persona: biases toward stdlib, native features, minimal code
+- **Up to 65% output token savings** with aggressive levels
+- Format-aware injection: works with OpenAI, Claude, and Gemini request formats
+- Persistence rules: stays active across turns, auto-clarity for security/irreversible actions
+
+#### Format Translation (token_translate.py)
+- **OpenAI ↔ Claude format conversion** for both requests and streaming responses
+- Registry-based translator pattern (extensible to Gemini, Kiro, Cursor, Ollama)
+- Handles tool calls, image data, system messages, and content blocks
+
+#### 3-Tier Fallback Routing (token_routing.py)
+- **Provider tiers**: Subscription → Cheap → Free
+- **Smart error classification**: HTTP 429/401/403/503 trigger exponential backoff
+- **Auto-fallback**: when a provider hits rate limits or quota, the router tries the next tier
+- **Resolve command**: test whether an error should trigger fallback
+
+#### Multi-Account Round-Robin (token_routing.py + token_usages.py)
+- **Multiple API keys per provider** with priority-based selection
+- **Round-robin rotation** across accounts to maximize free-tier quota
+- **Exponential backoff** on errors (2s → 4s → 8s → ... → 5 min max)
+- **Model-level locks**: prevent a model from hitting the same account repeatedly
+
+#### Quota Tracking (token_usages.py)
+- **Per-provider quota**: remaining, total, reset countdown
+- **Cost tracking**: cumulative spend per provider
+- **Rate-limit detection**: automatic cooldown marking
+- **Persistence**: data stored in `~/.config/opencode/compress/quota_tracker.json`
+
+#### Auto Token Refresh (token_refresh.py)
+- **OAuth token expiry checking**: decodes JWT tokens and checks remaining time
+- **Pre-emptive refresh**: triggers when token is within configurable buffer window
+- **Supported providers**: Claude Code (300s buffer), Gemini CLI (120s), GitHub Copilot (60s)
+- **Register & track**: log tokens for automatic refresh management
+
+### New in v9.0 (ctxrs/ctx inspired) — Search, MCP, Skills, Upgrade
 
 #### SQLite FTS5 Search Index
 - **Full-text search** across compression history, proxy requests, and cache entries
@@ -242,13 +288,86 @@ python token-saver.py fallback resolve "openai/gpt-4"
 python token-saver.py fallback remove "openai/gpt-4"
 ```
 
-### Web Dashboard (NEW)
+### Advanced Token-Saving Commands (NEW — v9.5)
+
+#### RTK Tool-Result Compression
+```bash
+python token-saver.py rtk test "$(git diff)"              # Test RTK on git diff output
+python token-saver.py rtk test "$(git status)"            # Test RTK on git status
+python token-saver.py rtk test "$(grep -r foo .)"        # Test RTK on grep output
+python token-saver.py rtk test "$(ls -la)"                # Test RTK on ls output
+python token-saver.py rtk auto "$(git log)"              # Auto-detect which filter matches
+python token-saver.py rtk filters                         # List all 12 available filters
+```
+
+#### Caveman / Ponytail Mode
+```bash
+python token-saver.py caveman inject lite                 # Show the lite caveman prompt
+python token-saver.py caveman inject full                 # Full caveman mode (~50% output savings)
+python token-saver.py caveman inject ultra                # Ultra compression (~65%)
+python token-saver.py caveman inject wenyan               # Classical Chinese compression
+python token-saver.py caveman ponytail lite               # Lazy senior dev (lite)
+python token-saver.py caveman ponytail ultra              # YAGNI extremist
+```
+
+#### Format Translation
+```bash
+python token-saver.py translate detect '{"messages":[{"role":"user","content":"hi"}]}'
+# Detects: openai, claude, gemini, etc.
+```
+
+#### 3-Tier Fallback Routing
+```bash
+python token-saver.py routing providers                   # Show Subscription→Cheap→Free tiers
+python token-saver.py routing chain claude-code           # Full fallback chain for a provider
+python token-saver.py routing resolve 429 "rate limit"    # Test if error triggers fallback
+```
+
+#### Quota Tracking
+```bash
+python token-saver.py quota show                          # Show all provider quotas
+python token-saver.py quota show openai                   # Show quota for specific provider
+python token-saver.py quota update openai --remaining 4000 --reset-at "2026-07-27T00:00:00Z"
+```
+
+#### Multi-Account Round-Robin
+```bash
+python token-saver.py accounts add openai --api-key sk-... --priority 0
+python token-saver.py accounts add openai --api-key sk-... --priority 1
+python token-saver.py accounts list                       # List all configured accounts
+```
+
+#### Auto Token Refresh
+```bash
+python token-saver.py token-refresh providers             # Show auto-refresh supported providers
+python token-saver.py token-refresh check eyJhbGci...     # Check JWT token expiry
+python token-saver.py token-refresh register openai sk-... --refresh-token rtk-...
+python token-saver.py token-refresh status                # Show registered tokens
+```
+
+### Web Dashboard
 ```bash
 python token-saver.py dashboard start --port 8200    # Start dashboard
 python token-saver.py dashboard status                # Check status
 python token-saver.py dashboard stop                  # Stop dashboard
 ```
-Open http://127.0.0.1:8200 in your browser for real-time monitoring of cache stats, savings, proxy, budget, store, and fallback chains.
+Open http://127.0.0.1:8200 in your browser for a comprehensive 9-page dashboard:
+
+- **Overview** — Total savings, cache stats, proxy status, quota tracking
+- **Usage** — Provider request volume, tokens in/out, estimated savings
+- **Quota** — Per-provider quota usage, reset countdowns, rate limit status
+- **Translator** — Format translation debug tool (OpenAI ↔ Claude ↔ Gemini)
+- **Routing** — 3-tier fallback chains with **one-click preset combos**:
+  - `maximize-claude` — Use Claude Pro subscription fully ($25/mo)
+  - `free-forever` — Zero cost with production-ready models ($0)
+  - `always-on` — 24/7 coding with 5 layers of fallback ($30-220/mo)
+  - `openclaw-free` — Free AI for WhatsApp, Telegram, Slack ($0)
+- **Providers** — Configured providers, API key status, batch testing
+- **Console Log** — Real-time proxy and translation logs
+- **Chat** — Test chat against any configured provider
+- **Settings** — Proxy config, routing preferences, database backup
+
+**Cost Display**: All costs shown are **estimated savings** (what you would have paid with paid APIs), not actual billing. You pay $0 with free tiers.
 
 ## Interactive Menu
 
@@ -256,9 +375,9 @@ Run without subcommand to see the full interactive menu:
 
 ```
   +==================================================+
-  |  OpenCode Token Saver CLI v9.0              |
+  |  OpenCode Token Saver CLI v9.5              |
   |  Compare - Compress - Cache - Proxy - Search     |
-  |  SQLite FTS5 index + MCP + Agent skills        |
+  |  RTK + Caveman + Translation + Routing + Quota  |
   +==================================================+
 
   Current Status
@@ -290,13 +409,22 @@ Run without subcommand to see the full interactive menu:
      15. Start Compression Proxy
      16. Stop Proxy
      17. Proxy Status
-     -- EXTRAS --
-     18. Providers & API Status
-     19. Provider Health Check
-     20. Token Budget Planner
-     21. Verify Config
-     22. Restore Backup
-     23. Exit
+      -- ADVANCED TOOLS --
+     18. RTK Tool-Result Compression
+     19. Caveman Mode (terse output)
+     20. Ponytail Mode (lazy dev)
+     21. Format Translation (OpenAI↔Claude)
+     22. 3-Tier Fallback Routing
+     23. Quota Tracking
+     24. Multi-Account Manager
+     25. Auto Token Refresh
+      -- EXTRAS --
+     26. Providers & API Status
+     27. Provider Health Check
+     28. Token Budget Planner
+     29. Verify Config
+     30. Restore Backup
+     31. Exit
 ```
 
 ## Compression Benchmarks
@@ -320,13 +448,25 @@ Run without subcommand to see the full interactive menu:
 | `cargo build` | 60-80%      | Errors + warnings only |
 | `docker ps`   | 80-90%      | Container count + status |
 
+| RTK Tool Result | Compression | Description |
+|-----------------|-------------|-------------|
+| `git diff`     | 40-60%      | File headers, hunk truncation, +/- summaries |
+| `git status`   | 40-70%      | Branch + file counts with caps |
+| `git log`      | 60-80%      | Commit subjects only, drop bodies |
+| `grep` results | 50-70%      | Group by file, cap matches per file |
+| `find` results | 50-70%      | Group by directory, cap entries |
+| `ls -la`       | 30-50%      | Compact listing + extension summary |
+| `tree`         | 10-30%      | Drop summary line, cap depth |
+| build logs     | 60-80%      | Errors + warnings + summary only |
+| duplicate lines | 20-40%     | Collapse consecutive repeats |
+
 ## Configuration
 
 The tool reads and writes to:
 - **Config**: `~/.config/opencode/opencode.jsonc`
 - **Backups**: `~/.config/opencode/opencode.jsonc.{timestamp}.backup` (last 5)
 - **Cache**: `~/.config/opencode/models_cache.json` (24h TTL)
-- **Compression**: `~/.config/opencode/compress/` (cache, store, ledger, budget, proxy config)
+- **Compression**: `~/.config/opencode/compress/` (cache, store, ledger, budget, proxy config, quota tracking, accounts, tokens)
 
 ## Data Source
 

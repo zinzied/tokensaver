@@ -29,6 +29,29 @@ except ImportError:
     print("Missing deps: pip install rich click requests")
     sys.exit(1)
 
+try:
+    import token_filters
+    import token_prompts
+    import token_translate
+    import token_tiers
+    from token_usages import QuotaTracker
+    from token_routing import AccountManager, TieredRouter, check_fallback_error
+    _ROUTER_AVAILABLE = True
+except ImportError as _r_err:
+    _ROUTER_AVAILABLE = False
+
+try:
+    from dashboard_ui import DASHBOARD_HTML as NEW_DASHBOARD_HTML
+except ImportError:
+    NEW_DASHBOARD_HTML = None
+
+DASHBOARD_SERVER_SCRIPT = Path(__file__).parent / "dashboard_server.py"
+
+try:
+    from token_refresh import TokenRefresher, auto_refresh_token, TOKEN_REFRESH_PROVIDERS, is_token_expired, get_token_remaining_sec, decode_jwt_payload
+    _AUTH_AVAILABLE = True
+except ImportError:
+    _AUTH_AVAILABLE = False
 
 try:
     if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
@@ -54,6 +77,8 @@ BUDGET_PATH     = COMPRESS_DIR / "budget.json"
 PROXY_CONFIG    = COMPRESS_DIR / "proxy.json"
 FALLBACK_PATH   = COMPRESS_DIR / "fallback.json"
 DASHBOARD_CONFIG = COMPRESS_DIR / "dashboard.json"
+QUOTA_TRACKER_PATH = COMPRESS_DIR / "quota_tracker.json"
+ACCOUNTS_PATH = COMPRESS_DIR / "accounts.json"
 COST_PRICING_PATH = COMPRESS_DIR / "proxy_pricing.json"
 SAVER_POLICY_PATH = COMPRESS_DIR / "saver_policy.json"
 COMPRESS_DIR.mkdir(parents=True, exist_ok=True)
@@ -3151,84 +3176,6 @@ Server(("127.0.0.1",''' + str(port) + r'''),PH).serve_forever()
 class DashboardServer:
     PORT = 8200
 
-    DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Token Saver Dashboard</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,monospace}
-body{background:#1a1a2e;color:#e0e0e0;padding:20px}
-.header{text-align:center;padding:20px;border-bottom:1px solid #333;margin-bottom:24px}
-.header h1{color:#00d4ff;font-size:24px;margin-bottom:8px}
-.header .sub{color:#888;font-size:13px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;max-width:1200px;margin:0 auto}
-.card{background:#16213e;border-radius:12px;padding:20px;border:1px solid #0f3460}
-.card h2{color:#00d4ff;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin-bottom:14px;border-bottom:1px solid #0f3460;padding-bottom:8px}
-.card .row{display:flex;justify-content:space-between;padding:6px 0;font-size:13px}
-.card .label{color:#888}
-.card .value{color:#e0e0e0;font-weight:500}
-.card .value.green{color:#00e676}
-.card .value.yellow{color:#ffd740}
-.card .value.red{color:#ff5252}
-.card .value.cyan{color:#00d4ff}
-.footer{text-align:center;padding:20px;color:#555;font-size:12px;margin-top:24px}
-.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.status-dot.green{background:#00e676}
-.status-dot.red{background:#ff5252}
-.status-dot.yellow{background:#ffd740}
-</style>
-</head>
-<body>
-<div class="header">
-<h1>&#9632; Token Saver Dashboard</h1>
-<div class="sub" id="sub">Model: <span id="model">-</span> &middot; Small: <span id="small">-</span> &middot; <span id="ts">loading...</span></div>
-</div>
-<div class="grid">
-<div class="card"><h2>&#128230; Cache</h2><div id="cache"><div class="row"><span class="label">Loading...</span></div></div></div>
-<div class="card"><h2>&#128176; Savings</h2><div id="savings"><div class="row"><span class="label">Loading...</span></div></div></div>
-<div class="card"><h2>&#128274; Proxy</h2><div id="proxy"><div class="row"><span class="label">Loading...</span></div></div></div>
-<div class="card"><h2>&#128200; Budget</h2><div id="budget"><div class="row"><span class="label">Loading...</span></div></div></div>
-<div class="card"><h2>&#128451; Store</h2><div id="store"><div class="row"><span class="label">Loading...</span></div></div></div>
-<div class="card"><h2>&#128279; Fallback Chains</h2><div id="fallback"><div class="row"><span class="label">Loading...</span></div></div></div>
-</div>
-<div class="footer" id="footer">Auto-refresh every 5s</div>
-<script>
-async function load(){try{
-const r=await fetch('/api/stats');const d=await r.json();
-document.getElementById('model').textContent=d.model.model||'-';
-document.getElementById('small').textContent=d.model.small_model||'-';
-document.getElementById('ts').textContent=new Date(d.timestamp).toLocaleTimeString();
-const c=d.cache||{};document.getElementById('cache').innerHTML=
-`<div class="row"><span class="label">Cached Files</span><span class="value">${c.cached_files||0}</span></div>
-<div class="row"><span class="label">Total Saved</span><span class="value green">${(c.total_savings_tokens||0).toLocaleString()} tokens</span></div>
-<div class="row"><span class="label">Avg Compression</span><span class="value yellow">${(c.total_savings_pct||0).toFixed(1)}%</span></div>`;
-const s=d.savings||{};document.getElementById('savings').innerHTML=
-`<div class="row"><span class="label">Entries</span><span class="value">${s.total_entries||0}</span></div>
-<div class="row"><span class="label">Total Saved</span><span class="value green">${(s.total_saved_tokens||0).toLocaleString()} tokens</span></div>
-<div class="row"><span class="label">Compression</span><span class="value yellow">${s.compression_pct||0}%</span></div>`;
-const p=d.proxy||{};const pStat=p.running?'green':'red';const pTxt=p.running?'Running':'Stopped';
-document.getElementById('proxy').innerHTML=
-`<div class="row"><span class="label">Status</span><span class="value"><span class="status-dot ${pStat}"></span>${pTxt}</span></div>
-<div class="row"><span class="label">Port</span><span class="value">${p.port||'-'}</span></div>
-<div class="row"><span class="label">Requests</span><span class="value">${p.requests_served||0}</span></div>
-<div class="row"><span class="label">Tokens Saved</span><span class="value green">${(p.total_saved_tokens||0).toLocaleString()}</span></div>`;
-const b=d.budget||{};document.getElementById('budget').innerHTML=
-`<div class="row"><span class="label">Plan Active</span><span class="value">${b.has_plan?'Yes':'No'}</span></div>
-<div class="row"><span class="label">Budget Limit</span><span class="value">${(b.budget_limit||0).toLocaleString()}</span></div>
-<div class="row"><span class="label">Allocated</span><span class="value">${(b.total_allocated||0).toLocaleString()}</span></div>`;
-const st=d.store||{};document.getElementById('store').innerHTML=
-`<div class="row"><span class="label">Entries</span><span class="value">${st.entries||0}</span></div>
-<div class="row"><span class="label">Total Bytes</span><span class="value">${(st.total_bytes||0).toLocaleString()}</span></div>`;
-const f=d.fallback||{};document.getElementById('fallback').innerHTML=
-`<div class="row"><span class="label">Chains</span><span class="value">${f.chains||0}</span></div>`;
-}catch(e){document.getElementById('sub').textContent='Error loading stats'}}
-load();setInterval(load,5000);
-</script>
-</body>
-</html>"""
-
     @staticmethod
     def start(port: int = None) -> bool:
         cfg = DashboardServer.config()
@@ -3240,89 +3187,41 @@ load();setInterval(load,5000);
                     return False
             except: pass
         port = port or DashboardServer.PORT
-        script = r'''import json, os, http.server, sys, time
-from pathlib import Path
-CACHE = r"''' + str(CONTENT_CACHE).replace("\\", "\\\\") + r'''"
-STORE = r"''' + str(CONTENT_STORE).replace("\\", "\\\\") + r'''"
-LEDGER = r"''' + str(LEDGER_PATH).replace("\\", "\\\\") + r'''"
-BUDGET = r"''' + str(BUDGET_PATH).replace("\\", "\\\\") + r'''"
-PROXY_CFG = r"''' + str(PROXY_CONFIG).replace("\\", "\\\\") + r'''"
-FALLBACK = r"''' + str(FALLBACK_PATH).replace("\\", "\\\\") + r'''"
-CONFIG = r"''' + str(CONFIG_PATH).replace("\\", "\\\\") + r'''"
-DASH_CFG = r"''' + str(DASHBOARD_CONFIG).replace("\\", "\\\\") + r'''"
-HTML = r"""''' + DashboardServer.DASHBOARD_HTML + r'''"""
-def rough(s): return len(s)//4
-class DH(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path=="/":
-            self.send_response(200); self.send_header("Content-Type","text/html"); self.send_header("Cache-Control","no-cache"); self.end_headers()
-            self.wfile.write(HTML.encode("utf-8"))
-        elif self.path=="/api/stats":
-            cfg={};st={};ld={};bd={};px={};fb={};mc={}
-            if os.path.exists(CACHE):
-                try:
-                    import glob as g; now=time.time(); ts=0; tf=0; v=0
-                    for f in g.glob(os.path.join(CACHE,"*.json")):
-                        try:
-                            d=json.load(open(f,encoding="utf-8"))
-                            if now-d.get("cached_at",0)>3600: continue
-                            v+=1; ts+=d.get("saved_tokens",0); tf+=d.get("compressed_tokens",0)+d.get("saved_tokens",0)
-                        except: pass
-                    st={"cached_files":v,"total_savings_tokens":ts,"total_savings_pct":round(ts/tf*100,1) if tf>0 else 0}
-                except: pass
-            if os.path.exists(LEDGER):
-                try:
-                    e=json.load(open(LEDGER,encoding="utf-8")); ts2=sum(x.get("saved_tokens",0) for x in e); tr=sum(x.get("raw_tokens",0) for x in e)
-                    ld={"total_entries":len(e),"total_saved_tokens":ts2,"compression_pct":round(ts2/tr*100,1) if tr>0 else 0}
-                except: pass
-            if os.path.exists(PROXY_CFG):
-                try:
-                    p=json.load(open(PROXY_CFG,encoding="utf-8")); rn=False
-                    try:
-                        import urllib.request
-                        urllib.request.urlopen("http://127.0.0.1:"+str(p.get("port",8199)),timeout=2); rn=True
-                    except: pass
-                    px={"enabled":p.get("enabled",False),"running":rn,"port":p.get("port",8199),"total_saved_tokens":p.get("total_saved_tokens",0),"requests_served":len(p.get("history",[]))}
-                except: pass
-            if os.path.exists(BUDGET):
-                try:
-                    b=json.load(open(BUDGET,encoding="utf-8"))
-                    bd={"has_plan":bool(b),"budget_limit":b.get("budget_limit",0),"total_allocated":b.get("total_allocated",0)}
-                except: pass
-            if os.path.exists(FALLBACK):
-                try: fb={"chains":len(json.load(open(FALLBACK,encoding="utf-8")))}
-                except: pass
-            if os.path.exists(CONFIG):
-                try:
-                    import re; t=re.sub(r'^\s*//.*','',open(CONFIG,encoding="utf-8").read(),flags=re.MULTILINE); t=re.sub(r'/\*[\s\S]*?\*/','',t)
-                    mc=json.loads(t)
-                except: pass
-            ss={"entries":0,"total_bytes":0}
-            if os.path.exists(STORE):
-                try: ss["entries"]=len(os.listdir(STORE)); ss["total_bytes"]=sum(os.path.getsize(os.path.join(STORE,f)) for f in os.listdir(STORE) if os.path.isfile(os.path.join(STORE,f)))
-                except: pass
-            stats={"cache":st,"savings":ld,"proxy":px,"budget":bd,"store":ss,"model":{"model":mc.get("model",""),"small_model":mc.get("small_model","")},"fallback":fb,"timestamp":__import__("datetime").datetime.now().isoformat()}
-            self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-cache"); self.end_headers()
-            self.wfile.write(json.dumps(stats).encode("utf-8"))
-        else: self.send_response(404); self.end_headers()
-    def log_message(self,f,*a): pass
-try:
-    srv=http.server.HTTPServer(("127.0.0.1",''' + str(port) + r'''),DH)
-    json.dump({"port":''' + str(port) + r''',"enabled":True,"pid":os.getpid()},open(DASH_CFG,"w"))
-    srv.serve_forever()
-except Exception as e:
-    json.dump({"port":''' + str(port) + r''',"enabled":False,"error":str(e)},open(DASH_CFG,"w"))
-'''
-        script_path = COMPRESS_DIR / "_dashboard_server.py"
-        script_path.write_text(script, encoding="utf-8")
+        # Write dashboard HTML to COMPRESS_DIR
+        html_content = NEW_DASHBOARD_HTML if NEW_DASHBOARD_HTML else DashboardServer._fallback_html()
+        (COMPRESS_DIR / "_dashboard.html").write_text(html_content, encoding="utf-8")
+        # Write config JSON for the server
+        server_config = {
+            "port": port,
+            "content_cache": str(CONTENT_CACHE),
+            "content_store": str(CONTENT_STORE),
+            "ledger": str(LEDGER_PATH),
+            "budget": str(BUDGET_PATH),
+            "proxy_config": str(PROXY_CONFIG),
+            "fallback": str(FALLBACK_PATH),
+            "config": str(CONFIG_PATH),
+            "dashboard_config": str(DASHBOARD_CONFIG),
+            "quota_tracker": str(QUOTA_TRACKER_PATH),
+            "accounts": str(ACCOUNTS_PATH),
+        }
+        config_path = COMPRESS_DIR / "_dashboard_config.json"
+        config_path.write_text(json.dumps(server_config, indent=2), encoding="utf-8")
+        # Copy server script to COMPRESS_DIR
+        script_dest = COMPRESS_DIR / "_dashboard_server.py"
+        if DASHBOARD_SERVER_SCRIPT.exists():
+            shutil.copy2(str(DASHBOARD_SERVER_SCRIPT), str(script_dest))
+        else:
+            console.print("  [red][ERR] dashboard_server.py not found in project directory[/]")
+            return False
         try:
             proc = subprocess.Popen(
-                [sys.executable, str(script_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                [sys.executable, str(script_dest), str(config_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
-            time.sleep(1)
+            time.sleep(1.5)
             if proc.poll() is not None:
-                console.print(f"  [red][ERR] Dashboard process exited immediately.[/]")
+                console.print("  [red][ERR] Dashboard process exited immediately.[/]")
                 return False
             DashboardServer.save_config({"port": port, "enabled": True, "pid": proc.pid})
             console.print(f"  [green][OK] Dashboard started at http://127.0.0.1:{port}[/]")
@@ -3330,6 +3229,13 @@ except Exception as e:
         except Exception as e:
             console.print(f"  [red][ERR] Failed to start dashboard: {e}[/]")
             return False
+
+    @staticmethod
+    def _fallback_html() -> str:
+        return """<!DOCTYPE html><html><head><title>Token Saver</title></head>
+<body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;padding:40px;text-align:center">
+<h1>Token Saver Dashboard</h1><p>HTML template not found. Ensure dashboard_ui.py is in the project directory.</p>
+<p style="color:#8b949e">Falling back to basic view.</p></body></html>"""
 
     @staticmethod
     def stop() -> bool:
@@ -4088,6 +3994,309 @@ def upgrade(check: bool, apply: bool):
         console.print(f"  [dim]Could not check for updates: {e}[/]")
 
 # ============================================================================
+# RTK COMPRESSION, FORMAT TRANSLATION, QUOTA TRACKING & ROUTING
+# ============================================================================
+
+if _ROUTER_AVAILABLE:
+    @cli.group()
+    def rtk():
+        """RTK token saver — compress tool_result content"""
+        pass
+
+    @rtk.command(name="test")
+    @click.argument("text", nargs=-1, required=True)
+    def rtk_test(text):
+        """Test RTK compression on arbitrary text"""
+        t = " ".join(text)
+        fn = token_filters.auto_detect_filter(t)
+        if fn:
+            compressed = token_filters.safe_apply(fn, t)
+            saved = len(t) - len(compressed)
+            pct = (saved / len(t)) * 100 if len(t) > 0 else 0
+            console.print(f"\n  [cyan]Filter:[/] [green]{fn.__name__}[/]")
+            console.print(f"  [cyan]Original:[/] {len(t):,} chars")
+            console.print(f"  [cyan]Compressed:[/] {len(compressed):,} chars")
+            console.print(f"  [cyan]Saved:[/] [green]{saved:,} chars ({pct:.1f}%)[/]")
+            console.print(f"\n  [yellow]Result:[/]\n{compressed}")
+        else:
+            console.print("  [yellow]No matching RTK filter found for this text.[/]")
+
+    @rtk.command(name="filters")
+    def rtk_filters():
+        """List all available RTK compression filters"""
+        console.print("\n  [yellow]Available RTK Filters[/]\n")
+        tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+        tbl.add_column("Filter", style="green")
+        tbl.add_column("Description", style="white")
+        filters = [
+            ("git-diff", "Compact unified diff: file headers, hunk truncation, +/- summaries"),
+            ("git-status", "Branch, staged/modified/untracked files with caps"),
+            ("git-log", "Commit headers + subjects, drop body/diffs"),
+            ("grep", "Group by file, cap matches per file"),
+            ("find", "Group by directory, cap files per dir"),
+            ("ls", "Compact listing with extension summary"),
+            ("tree", "Drop summary line, cap long output"),
+            ("dedup-log", "Collapse consecutive duplicate lines"),
+            ("smart-truncate", "Keep head+tail, replace middle"),
+            ("read-numbered", "Line-numbered file dump truncation"),
+            ("search-list", "Cursor Glob results compression"),
+            ("build-output", "Errors+warnings+summary, drop progress logs"),
+        ]
+        for name, desc in filters:
+            tbl.add_row(name, desc)
+        console.print(tbl)
+
+    @rtk.command(name="auto")
+    @click.argument("text", nargs=-1, required=True)
+    def rtk_auto(text):
+        """Auto-detect which RTK filter matches the given text"""
+        t = " ".join(text)
+        fn = token_filters.auto_detect_filter(t)
+        if fn:
+            console.print(f"  [green]Detected filter:[/] {fn.__name__}")
+        else:
+            console.print("  [yellow]No filter matched[/]")
+
+    @cli.group()
+    def caveman():
+        """Caveman/Ponytail mode — inject terse-output prompts"""
+        pass
+
+    @caveman.command(name="inject")
+    @click.argument("level", type=click.Choice(["lite", "full", "ultra", "wenyan-lite", "wenyan", "wenyan-ultra"]))
+    def caveman_inject(level):
+        """Show the caveman prompt for a given level"""
+        prompt = token_prompts.CAVEMAN_PROMPTS.get(level, "")
+        console.print(f"\n  [cyan]Caveman Level:[/] [green]{level}[/]")
+        console.print(f"  [cyan]Prompt:[/]\n  {prompt}")
+
+    @caveman.command(name="ponytail")
+    @click.argument("level", type=click.Choice(["lite", "full", "ultra"]))
+    def caveman_ponytail(level):
+        """Show the ponytail prompt for a given level"""
+        prompt = token_prompts.PONYTAIL_PROMPTS.get(level, "")
+        console.print(f"\n  [cyan]Ponytail Level:[/] [green]{level}[/]")
+        console.print(f"  [cyan]Prompt:[/]\n  {prompt}")
+
+    @cli.group()
+    def translate():
+        """Format translation between API formats (OpenAI ↔ Claude)"""
+        pass
+
+    @translate.command(name="detect")
+    @click.argument("json_input")
+    def translate_detect(json_input):
+        """Detect the API format of a JSON request body"""
+        try:
+            body = json.loads(json_input)
+        except json.JSONDecodeError as e:
+            console.print(f"  [red]Invalid JSON: {e}[/]")
+            return
+        fmt = token_translate.detect_format(body)
+        console.print(f"  [green]Detected format:[/] {fmt}")
+
+    @cli.group()
+    def quota():
+        """Quota tracking and usage monitoring"""
+        pass
+
+    @quota.command(name="show")
+    @click.argument("provider", required=False)
+    def quota_show(provider):
+        """Show quota usage for all providers or a specific one"""
+        qt = QuotaTracker()
+        if provider:
+            q = qt.get_quota(provider)
+            if q:
+                console.print(f"\n  [cyan]Provider:[/] [green]{provider}[/]")
+                if "remaining" in q:
+                    console.print(f"  [cyan]Remaining:[/] {q['remaining']}")
+                if "total_quota" in q:
+                    console.print(f"  [cyan]Total:[/] {q['total_quota']}")
+                console.print(f"  [cyan]Reset:[/] {qt.get_reset_countdown(provider) or 'N/A'}")
+                if "total_cost" in q:
+                    console.print(f"  [cyan]Total cost:[/] ${q['total_cost']:.4f}")
+                    console.print(f"  [cyan]Requests:[/] {q.get('request_count', 0)}")
+            else:
+                console.print(f"  [yellow]No quota data for {provider}[/]")
+        else:
+            summary = qt.get_summary()
+            if not summary:
+                console.print("  [dim]No quota data recorded yet.[/]")
+                return
+            console.print(f"\n  [yellow]Quota Overview[/]\n")
+            tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+            tbl.add_column("Provider", style="cyan")
+            tbl.add_column("Remaining", justify="right")
+            tbl.add_column("Total", justify="right")
+            tbl.add_column("Reset", style="dim")
+            tbl.add_column("Cost", justify="right")
+            for s in summary:
+                tbl.add_row(
+                    s["provider"],
+                    str(s.get("remaining", "N/A")),
+                    str(s.get("total", "N/A")),
+                    s.get("reset_in", ""),
+                    f"${s.get('cost', 0):.4f}" if s.get("cost") else ""
+                )
+            console.print(tbl)
+
+    @quota.command(name="update")
+    @click.argument("provider")
+    @click.option("--total", type=int, help="Total quota")
+    @click.option("--used", type=int, help="Used quota")
+    @click.option("--remaining", type=int, help="Remaining quota")
+    @click.option("--reset-at", help="Reset timestamp (ISO 8601)")
+    def quota_update(provider, total, used, remaining, reset_at):
+        """Update quota data for a provider"""
+        qt = QuotaTracker()
+        qt.update_quota(provider, total=total, used=used, remaining=remaining, reset_at=reset_at)
+        console.print(f"  [green][OK] Quota updated for {provider}[/]")
+
+    @cli.group()
+    def accounts():
+        """Multi-account round-robin management"""
+        pass
+
+    @accounts.command(name="add")
+    @click.argument("provider")
+    @click.option("--api-key", help="API key for this account")
+    @click.option("--base-url", help="Base URL override")
+    @click.option("--priority", type=int, default=0, help="Priority (lower = preferred)")
+    def accounts_add(provider, api_key, base_url, priority):
+        """Add an account for round-robin routing"""
+        am = AccountManager()
+        pid = am.add_account(provider, api_key=api_key, base_url=base_url, priority=priority)
+        console.print(f"  [green][OK] Added account [cyan]{pid}[/] for provider [cyan]{provider}[/][/]")
+
+    @accounts.command(name="list")
+    def accounts_list():
+        """List all configured accounts"""
+        am = AccountManager()
+        summary = am.get_summary()
+        if not summary:
+            console.print("  [dim]No accounts configured.[/]")
+            return
+        console.print(f"\n  [yellow]Configured Accounts[/]\n")
+        tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+        tbl.add_column("ID", style="cyan")
+        tbl.add_column("Provider", style="green")
+        tbl.add_column("Status")
+        tbl.add_column("Priority")
+        for a in summary:
+            tbl.add_row(a["id"], a["provider"], a["status"], str(a["priority"]))
+        console.print(tbl)
+
+    @cli.group(name="routing")
+    def routing_group():
+        """Tiered fallback routing across providers"""
+        pass
+
+    @routing_group.command(name="providers")
+    def routing_providers():
+        """Show providers grouped by tier"""
+        console.print(f"\n  [yellow]Provider Tiers (3-Tier Fallback)[/]\n")
+        for tier in ["subscription", "cheap", "free"]:
+            providers = token_tiers.PROVIDER_TIERS.get(tier, {})
+            if providers:
+                console.print(f"  [cyan]{tier.upper()}[/]")
+                for pid, info in providers.items():
+                    console.print(f"    [green]{pid}[/]  [dim]{info['name']} ({info['cost']})[/]")
+                console.print("")
+
+    @routing_group.command(name="chain")
+    @click.argument("provider_id")
+    def routing_chain(provider_id):
+        """Show the 3-tier fallback chain for a provider"""
+        router = TieredRouter()
+        chain = router.build_fallback_chain(provider_id)
+        tier = router.get_tier_for_provider(provider_id)
+        console.print(f"\n  [cyan]Provider:[/] [green]{provider_id}[/]  [dim](tier: {tier})[/]")
+        console.print(f"  [cyan]Fallback chain:[/]")
+        for i, p in enumerate([provider_id] + chain):
+            t = router.get_tier_for_provider(p)
+            tag = "primary" if i == 0 else f"fallback {i}"
+            console.print(f"    {i+1}. {p}  [dim]({t}) [{tag}][/]")
+
+    @routing_group.command(name="resolve")
+    @click.argument("status", type=int)
+    @click.argument("error_text", default="rate limit")
+    def routing_resolve(status, error_text):
+        """Check if an error should trigger provider fallback"""
+        result = check_fallback_error(status, error_text)
+        cooldown = result["cooldown_ms"]
+        console.print(f"  [cyan]Status:[/] HTTP {status}")
+        console.print(f"  [cyan]Error:[/] {error_text}")
+        console.print(f"  [cyan]Fallback:[/] {'[green]YES[/]' if result['should_fallback'] else '[red]NO[/]'}")
+        console.print(f"  [cyan]Cooldown:[/] {cooldown}ms")
+        if result.get("new_backoff_level"):
+            console.print(f"  [cyan]Backoff level:[/] {result['new_backoff_level']}")
+
+if _AUTH_AVAILABLE:
+    @cli.group(name="token-refresh")
+    def token_refresh_group():
+        """Auto token refresh for expiring OAuth tokens"""
+        pass
+
+    @token_refresh_group.command(name="check")
+    @click.argument("token")
+    def token_refresh_check(token):
+        """Check token expiry status"""
+        tr = TokenRefresher()
+        result = tr.check_expiry(token)
+        status_colors = {"ok": "green", "warning": "yellow", "critical": "red", "expired": "red", "unknown": "dim"}
+        color = status_colors.get(result["status"], "dim")
+        console.print(f"\n  [cyan]Status:[/] [{color}]{result['status']}[/]")
+        console.print(f"  [cyan]Message:[/] {result['message']}")
+
+    @token_refresh_group.command(name="providers")
+    def token_refresh_providers():
+        """Show providers that support auto token refresh"""
+        console.print(f"\n  [yellow]Auto-Refresh Providers[/]\n")
+        tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+        tbl.add_column("Provider", style="green")
+        tbl.add_column("Refresh Buffer", style="white")
+        for pid, cfg in TOKEN_REFRESH_PROVIDERS.items():
+            tbl.add_row(pid, f"{cfg['refresh_before_sec']}s before expiry")
+        console.print(tbl)
+        console.print("\n  [dim]Auto-refresh checks tokens before each request and refreshes")
+        console.print("  [dim]them automatically if they're close to expiring.[/]")
+
+    @token_refresh_group.command(name="register")
+    @click.argument("provider")
+    @click.argument("token")
+    @click.option("--refresh-token", help="Refresh token for OAuth flow")
+    @click.option("--expires-at", help="Expiry timestamp (ISO 8601)")
+    def token_refresh_register(provider, token, refresh_token, expires_at):
+        """Register a token for automatic refresh tracking"""
+        tr = TokenRefresher()
+        tr.register_token(provider, token, refresh_token=refresh_token, expires_at=expires_at)
+        console.print(f"  [green][OK] Token registered for {provider}[/]")
+
+    @token_refresh_group.command(name="status")
+    def token_refresh_status():
+        """Show all registered tokens and their refresh status"""
+        tr = TokenRefresher()
+        summary = tr.get_status_summary()
+        if not summary:
+            console.print("  [dim]No tokens registered.[/]")
+            return
+        console.print(f"\n  [yellow]Registered Tokens[/]\n")
+        tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+        tbl.add_column("Provider", style="cyan")
+        tbl.add_column("Has Refresh Token")
+        tbl.add_column("Auto-Refresh Supported")
+        tbl.add_column("Refresh Buffer")
+        for s in summary:
+            tbl.add_row(
+                s["provider"],
+                "[green]Yes[/]" if s["has_refresh_token"] else "[red]No[/]",
+                "[green]Yes[/]" if s["auto_refresh"] else "[dim]No[/]",
+                f"{s['refresh_before_sec']}s" if s["auto_refresh"] else "-"
+            )
+        console.print(tbl)
+
+# ============================================================================
 # INTERACTIVE MENU
 # ============================================================================
 
@@ -4122,6 +4331,16 @@ def interactive_menu():
         ("Start Compression Proxy",                         'proxy_start'),
         ("Stop Proxy",                                      'proxy_stop'),
         ("Proxy Status",                                    'proxy_stat'),
+        ("",                                                'sep'),
+        ("-- [cyan]ADVANCED TOOLS[/] --",                  'header'),
+        ("RTK Tool-Result Compression",                     'rtk_test'),
+        ("Caveman Mode (terse output)",                     'caveman_test'),
+        ("Ponytail Mode (lazy dev)",                        'ponytail_test'),
+        ("Format Translation (OpenAI↔Claude)",              'translate_test'),
+        ("3-Tier Fallback Routing",                         'routing_show'),
+        ("Quota Tracking",                                  'quota_show'),
+        ("Multi-Account Manager",                           'accounts_show'),
+        ("Auto Token Refresh",                              'token_refresh'),
         ("",                                                'sep'),
         ("-- [cyan]EXTRAS[/] --",                          'header'),
         ("Providers & API Status",                          'providers'),
@@ -4510,6 +4729,202 @@ def interactive_menu():
             if not catalog: press_any(); continue
             clean_invalid_keys(catalog); press_any()
 
+        elif action == 'rtk_test':
+            console.clear(); banner()
+            console.print("\n  [yellow]RTK Tool-Result Compression[/]\n")
+            console.print("  Paste tool output to compress (Ctrl+Z then Enter to finish, or type text and press Enter):")
+            try:
+                lines = []
+                while True:
+                    line = input()
+                    lines.append(line)
+            except EOFError:
+                pass
+            text = "\n".join(lines)
+            if text.strip():
+                fn = token_filters.auto_detect_filter(text)
+                if fn:
+                    compressed = token_filters.safe_apply(fn, text)
+                    saved = len(text) - len(compressed)
+                    pct = (saved / len(text)) * 100 if len(text) > 0 else 0
+                    console.print(f"\n  [cyan]Filter:[/] [green]{fn.__name__}[/]")
+                    console.print(f"  [cyan]Original:[/] {len(text):,} chars")
+                    console.print(f"  [cyan]Compressed:[/] {len(compressed):,} chars")
+                    console.print(f"  [cyan]Saved:[/] [green]{saved:,} chars ({pct:.1f}%)[/]")
+                    console.print(f"\n  [yellow]Result:[/]\n{compressed}")
+                else:
+                    console.print("  [yellow]No matching RTK filter found.[/]")
+            else:
+                console.print("  [yellow]No input provided.[/]")
+            press_any()
+
+        elif action == 'caveman_test':
+            console.clear(); banner()
+            console.print("\n  [yellow]Caveman Mode[/]\n")
+            console.print("  Level: 1=Lite  2=Full  3=Ultra  4=Wenyan-lite  5=Wenyan  6=Wenyan-ultra")
+            ch = input("  Choice [1]: ").strip() or "1"
+            levels = ["lite", "full", "ultra", "wenyan-lite", "wenyan", "wenyan-ultra"]
+            try:
+                level = levels[int(ch) - 1]
+            except (ValueError, IndexError):
+                level = "lite"
+            prompt = token_prompts.CAVEMAN_PROMPTS.get(level, "")
+            console.print(f"\n  [cyan]Caveman Level:[/] [green]{level}[/]")
+            console.print(f"  [cyan]Prompt:[/]\n  {prompt}\n")
+            console.print("  [dim]This prompt gets injected into the system message of every request.")
+            console.print("  [dim]It tells the LLM to respond tersely, saving output tokens.[/]")
+            press_any()
+
+        elif action == 'ponytail_test':
+            console.clear(); banner()
+            console.print("\n  [yellow]Ponytail Mode (Lazy Senior Dev)[/]\n")
+            console.print("  Level: 1=Lite  2=Full  3=Ultra")
+            ch = input("  Choice [1]: ").strip() or "1"
+            levels = ["lite", "full", "ultra"]
+            try:
+                level = levels[int(ch) - 1]
+            except (ValueError, IndexError):
+                level = "lite"
+            prompt = token_prompts.PONYTAIL_PROMPTS.get(level, "")
+            console.print(f"\n  [cyan]Ponytail Level:[/] [green]{level}[/]")
+            console.print(f"  [cyan]Prompt:[/]\n  {prompt}\n")
+            console.print("  [dim]This prompt biases the LLM toward stdlib, native features, and minimal code.[/]")
+            press_any()
+
+        elif action == 'translate_test':
+            console.clear(); banner()
+            console.print("\n  [yellow]Format Translation[/]\n")
+            console.print("  Translate between API formats (OpenAI ↔ Claude)")
+            console.print("\n  1. OpenAI → Claude")
+            console.print("  2. Claude → OpenAI")
+            ch = input("  Choice: ").strip()
+            if ch in ("1", "2"):
+                console.print("  Paste JSON request body (Ctrl+Z then Enter to finish):")
+                try:
+                    lines = []
+                    while True:
+                        line = input()
+                        lines.append(line)
+                except EOFError:
+                    pass
+                text = "\n".join(lines)
+                try:
+                    body = json.loads(text)
+                    if ch == "1":
+                        result = token_translate.translate_openai_to_claude(body)
+                        console.print("\n  [green]OpenAI → Claude:[/]\n")
+                    else:
+                        result = token_translate.translate_claude_to_openai(body)
+                        console.print("\n  [green]Claude → OpenAI:[/]\n")
+                    console.print(json.dumps(result, indent=2))
+                except json.JSONDecodeError as e:
+                    console.print(f"  [red]Invalid JSON: {e}[/]")
+            press_any()
+
+        elif action == 'routing_show':
+            console.clear(); banner()
+            console.print("\n  [yellow]3-Tier Fallback Routing[/]\n")
+            for tier in ["subscription", "cheap", "free"]:
+                providers = token_tiers.PROVIDER_TIERS.get(tier, {})
+                if providers:
+                    console.print(f"  [cyan]{tier.upper()}[/]")
+                    for pid, info in providers.items():
+                        console.print(f"    [green]{pid}[/]  [dim]{info['name']} ({info['cost']})[/]")
+                    console.print("")
+            console.print("  [dim]Run: python token-saver.py routing chain <provider>[/]")
+            press_any()
+
+        elif action == 'quota_show':
+            console.clear(); banner()
+            console.print("\n  [yellow]Quota Tracking[/]\n")
+            qt = QuotaTracker()
+            summary = qt.get_summary()
+            if summary:
+                tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                tbl.add_column("Provider", style="cyan")
+                tbl.add_column("Remaining")
+                tbl.add_column("Total")
+                tbl.add_column("Reset")
+                tbl.add_column("Cost")
+                for s in summary:
+                    tbl.add_row(
+                        s["provider"],
+                        str(s.get("remaining", "N/A")),
+                        str(s.get("total", "N/A")),
+                        s.get("reset_in", ""),
+                        f"${s.get('cost', 0):.4f}" if s.get("cost") else ""
+                    )
+                console.print(tbl)
+            else:
+                console.print("  [dim]No quota data recorded yet.[/]")
+            press_any()
+
+        elif action == 'accounts_show':
+            console.clear(); banner()
+            console.print("\n  [yellow]Multi-Account Manager[/]\n")
+            am = AccountManager()
+            summary = am.get_summary()
+            if summary:
+                tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                tbl.add_column("ID", style="cyan")
+                tbl.add_column("Provider", style="green")
+                tbl.add_column("Status")
+                tbl.add_column("Priority")
+                for a in summary:
+                    tbl.add_row(a["id"], a["provider"], a["status"], str(a["priority"]))
+                console.print(tbl)
+                console.print("\n  [dim]To add an account: python token-saver.py accounts add <provider> --api-key <key>[/]")
+            else:
+                console.print("  [dim]No accounts configured.[/]")
+            press_any()
+
+        elif action == 'token_refresh':
+            console.clear(); banner()
+            console.print("\n  [yellow]Auto Token Refresh[/]\n")
+            if not _AUTH_AVAILABLE:
+                console.print("  [red]token_refresh module not available.[/]")
+                press_any(); continue
+            console.print("  1. Check token expiry")
+            console.print("  2. Register a token")
+            console.print("  3. Show registered tokens")
+            console.print("  4. Show supported providers")
+            ch = input("  Choice: ").strip()
+            if ch == "1":
+                tok = input("  Enter token (or prefix): ").strip()
+                if tok:
+                    tr = TokenRefresher()
+                    r = tr.check_expiry(tok)
+                    status_colors = {"ok": "green", "warning": "yellow", "critical": "red", "expired": "red", "unknown": "dim"}
+                    c = status_colors.get(r["status"], "dim")
+                    console.print(f"\n  [cyan]Status:[/] [{c}]{r['status']}[/]")
+                    console.print(f"  [cyan]{r['message']}[/]")
+            elif ch == "2":
+                prov = input("  Provider: ").strip()
+                tok = input("  Token: ").strip()
+                rt = input("  Refresh token (optional): ").strip() or None
+                if prov and tok:
+                    tr = TokenRefresher()
+                    tr.register_token(prov, tok, refresh_token=rt)
+                    console.print(f"  [green][OK] Token registered for {prov}[/]")
+            elif ch == "3":
+                tr = TokenRefresher()
+                summary = tr.get_status_summary()
+                if summary:
+                    tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                    tbl.add_column("Provider", style="cyan")
+                    tbl.add_column("Has Refresh")
+                    tbl.add_column("Auto-Refresh")
+                    for s in summary:
+                        tbl.add_row(s["provider"], str(s["has_refresh_token"]), str(s["auto_refresh"]))
+                    console.print(tbl)
+                else:
+                    console.print("  [dim]No tokens registered.[/]")
+            elif ch == "4":
+                console.print(f"\n  [yellow]Supported Providers[/]\n")
+                for pid, cfg in TOKEN_REFRESH_PROVIDERS.items():
+                    console.print(f"  [green]{pid}[/]  [dim]refresh {cfg['refresh_before_sec']}s before expiry[/]")
+            press_any()
+
         elif action == 'compress_read':
             console.clear(); banner()
             console.print("\n  [yellow]Compress File Read[/]\n")
@@ -4739,7 +5154,7 @@ def interactive_menu():
     console.print("\n  [yellow]Bye! Restart opencode if you changed anything.[/]")
 
 if __name__ == "__main__":
-    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h"}
+    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh"}
     first = sys.argv[1] if len(sys.argv) > 1 else ""
     if len(sys.argv) == 1:
         try: interactive_menu()
