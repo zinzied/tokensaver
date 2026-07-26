@@ -270,6 +270,25 @@ def write_config(model_id: str, small_id: str):
         rotate_backup()
     text = json.dumps(con, indent=2)
     CONFIG_PATH.write_text(text + '\n', encoding="utf-8")
+    _sync_model_state(model_id, small_id)
+
+def _sync_model_state(model_id: str, small_id: str):
+    state_path = Path.home() / '.local' / 'state' / 'opencode' / 'model.json'
+    if not state_path.exists():
+        return
+    try:
+        data = json.loads(state_path.read_text(encoding='utf-8'))
+        if '/' in model_id:
+            parts = model_id.split('/', 1)
+            new_entry = {"providerID": parts[0], "modelID": parts[1]}
+        else:
+            new_entry = {"providerID": "opencode", "modelID": model_id}
+        recent = data.get('recent', [])
+        recent = [e for e in recent if not (e.get('providerID') == new_entry['providerID'] and e.get('modelID') == new_entry['modelID'])]
+        recent.insert(0, new_entry)
+        data['recent'] = recent[:20]
+        state_path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+    except: pass
 
 def rotate_backup():
     if not CONFIG_PATH.exists(): return
@@ -302,13 +321,27 @@ def get_configured_providers() -> list[str]:
     configured.update(get_providers_from_catalog_crossref())
     return sorted(configured)
 
+def get_working_providers() -> list[str]:
+    """Providers that actually have API access (env var key or config with baseURL)."""
+    working = set()
+    cfg = read_config()
+    if cfg and isinstance(cfg.get("provider"), dict):
+        for pid, pdata in cfg["provider"].items():
+            if isinstance(pdata, dict):
+                opts = pdata.get("options", {})
+                if opts.get("baseURL"):
+                    working.add(pid)
+    working.update(get_providers_from_env())
+    return sorted(working)
+
 def get_explicit_provider_ids() -> list[str]:
-    """Providers with an explicit config entry or current API-key env var."""
+    """Providers with an explicit config entry, current API-key env var, or model history."""
     configured = set()
     cfg = read_config()
     if cfg and isinstance(cfg.get("provider"), dict):
         configured.update(cfg["provider"].keys())
     configured.update(get_providers_from_env())
+    configured.update(get_providers_from_model_history())
     return sorted(configured)
 
 def fetch_catalog() -> tuple[dict | None, list[dict]]:
@@ -377,7 +410,7 @@ def diff_new_models(old_snap: dict, catalog: dict) -> list[dict]:
 def get_user_models() -> tuple[dict | None, list[dict]]:
     catalog, new_models = fetch_catalog()
     if not catalog: return None, []
-    configured = get_configured_providers()
+    configured = get_working_providers()
     result = {}
     for provider_id, pdata in catalog.items():
         if not isinstance(pdata, dict) or "models" not in pdata: continue
@@ -457,6 +490,7 @@ def configured_model_list(catalog: dict, strict: bool = False) -> list[dict]:
         m for _key, pd in catalog.items()
         if (pd.get("id") in explicit if strict else pd.get("configured"))
         for m in pd.get("models", [])
+        if m.get("status") != "deprecated"
     ]
 
 def choose_saver_models(catalog: dict, mode: str, task: str, max_paid_cost: float, provider: str | None = None, strict: bool = False) -> dict:
@@ -666,6 +700,7 @@ def select_model_from_provider(catalog: dict, current_id: str | None = None, tit
     if not provider_data: return None
     model_items = []
     for m in provider_data["models"]:
+        if m.get("status") == "deprecated": continue
         price_str = "FREE" if m['is_free'] else f"${m['input_price']:.4f}/${m['output_price']:.4f}"
         model_items.append({"id": m["id"], "name": f"{m['name']}  ({price_str})"})
     return menu(f"{title} - {provider_data['name']}", model_items, current_id)
@@ -773,11 +808,13 @@ def show_health_check(catalog: dict):
     console.print(tbl)
 
 def clean_invalid_keys(catalog: dict):
+    env_pids = set(get_providers_from_env())
     configured_pids = set()
     for key, pd in catalog.items():
-        if pd["configured"]: configured_pids.add(pd["id"])
+        if pd["configured"] and pd["id"] in env_pids:
+            configured_pids.add(pd["id"])
     if not configured_pids:
-        console.print("  [yellow]No configured providers to check.[/]"); return
+        console.print("  [yellow]No providers with API keys in env vars to check.[/]"); return
     console.print("\n  [yellow]Checking provider connectivity (3s timeout)...[/]")
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
@@ -803,49 +840,33 @@ def clean_invalid_keys(catalog: dict):
         if msg: label += f"  [dim]{msg}[/]"
         tbl.add_row(f"  [cyan]{pid}[/]", label)
     console.print(tbl)
-    if not confirm("Remove these providers from config?"):
+    if not confirm("Clear invalid env vars via setx?"):
         console.print("  [dim]Skipped.[/]"); return
     cfg = read_config()
-    removed = []
-    env_only = []
+    env_actions = []
     for pid in bad:
-        if cfg and "provider" in cfg and pid in cfg["provider"]:
-            del cfg["provider"][pid]
-            removed.append(pid)
-        else:
-            env_only.append(pid)
-    if removed:
-        write_config(cfg.get("model", ""), cfg.get("small_model", ""))
-        for pid in removed:
-            console.print(f"  [green]Removed {pid} from config.[/]")
-        console.print("  [green]Config updated. Restart opencode to apply.[/]")
-    if env_only:
-        console.print("\n  [yellow]These providers were detected from environment variables:[/]")
-        env_actions = []
-        for pid in env_only:
-            env_vars = KNOWN_PROVIDER_ENV_VARS.get(pid, [])
-            active = [v for v in env_vars if os.environ.get(v, "")]
-            if active:
-                for v in active:
-                    env_actions.append((pid, v))
-        if env_actions:
-            console.print("")
+        env_vars = KNOWN_PROVIDER_ENV_VARS.get(pid, [])
+        active = [v for v in env_vars if os.environ.get(v, "")]
+        if active:
+            for v in active:
+                env_actions.append((pid, v))
+    if env_actions:
+        console.print("")
+        for pid, v in env_actions:
+            console.print(f"  [cyan]{pid}[/]  ->  {v}={os.environ.get(v,'')[:60]}")
+        if confirm(f"Clear {len(env_actions)} env var(s) via setx?"):
             for pid, v in env_actions:
-                console.print(f"  [cyan]{pid}[/]  ->  {v}={os.environ.get(v,'')[:60]}")
-            if confirm("Clear these env vars via setx?"):
-                for pid, v in env_actions:
-                    r = subprocess.run(["setx", v, ""], capture_output=True)
-                    if r.returncode == 0:
-                        console.print(f"  [green]Cleared {v} for {pid}.[/]")
-                    else:
-                        msg = r.stderr.decode("utf-8", errors="replace").strip()
-                        console.print(f"  [red]Failed to clear {v}: {msg}[/]")
-                console.print("  [green]Env vars cleared. Restart your terminal to take effect.[/]")
-                console.print("  [yellow]Run health check again after restart to confirm.[/]")
-            else:
-                console.print("  [dim]Skipped. Run setx manually to clear them.[/]")
+                r = subprocess.run(["setx", v, ""], capture_output=True)
+                if r.returncode == 0:
+                    console.print(f"  [green]Cleared {v} for {pid}.[/]")
+                else:
+                    msg = r.stderr.decode("utf-8", errors="replace").strip()
+                    console.print(f"  [red]Failed to clear {v}: {msg}[/]")
+            console.print("  [green]Env vars cleared. Restart your terminal to take effect.[/]")
         else:
-            console.print("  [yellow]No known env vars found. Check your system environment variables.[/]")
+            console.print("  [dim]Skipped.[/]")
+    else:
+        console.print("  [yellow]No known env vars found. Check your system environment variables.[/]")
 
 TASK_TEMPLATES: dict[str, list[dict]] = {
     "coding": [
@@ -968,7 +989,8 @@ def set_cmd(tier: str, provider: str | None):
     for key, pd in catalog.items():
         if not pd["configured"]: continue
         if provider and provider.lower() not in pd["id"].lower(): continue
-        for m in pd["models"]: all_models.append(m)
+        for m in pd["models"]:
+            if m.get("status") != "deprecated": all_models.append(m)
     if not all_models:
         console.print("  [red]No configured providers found. Add API keys first.[/]")
         return
@@ -997,7 +1019,7 @@ def save_max(no_proxy: bool):
         catalog, _ = get_user_models()
     if not catalog:
         console.print("  [red]Could not fetch model data.[/]"); return
-    configured = [m for k, pd in catalog.items() if pd["configured"] for m in pd["models"]]
+    configured = [m for k, pd in catalog.items() if pd["configured"] for m in pd["models"] if m.get("status") != "deprecated"]
     if not configured:
         console.print("  [red]No configured providers. Add API keys first.[/]"); return
     configured.sort(key=lambda x: x["input_price"] + x["output_price"])
@@ -1087,7 +1109,7 @@ def save_money(save_mode: str, task: str, max_paid_cost: float, daily_budget: fl
     tbl = Table(box=box.SIMPLE, show_header=False)
     tbl.add_column("Setting", style="cyan")
     tbl.add_column("Value", style="white")
-    tbl.add_row("  Mode", f"{save_mode.lower()} ({'avoid paid models first' if save_mode.lower() == 'free' else 'cap paid model cost'})")
+    tbl.add_row("  Mode", f"{save_mode.lower()} ({'prefer free models, save token quota' if save_mode.lower() == 'free' else 'cap paid model cost'})")
     tbl.add_row("  Provider filter", provider or "[dim]any explicit provider when applying[/]")
     tbl.add_row("  Main model", f"{main_model['name']}  [dim]{main_model['id']}[/]  {'[green]FREE[/]' if main_model.get('is_free') else f'${main_cost:.4f}/M'}")
     tbl.add_row("  Small model", f"{small_model['name']}  [dim]{small_model['id']}[/]  {'[green]FREE[/]' if small_model.get('is_free') else f'${small_cost:.4f}/M'}")
@@ -1244,7 +1266,7 @@ def compare(free: bool, cheap: bool, provider: str, refresh: bool, tools: bool, 
     unconfigured_free = {}
     for key, pd in catalog.items():
         if provider and provider.lower() not in pd["id"].lower(): continue
-        models = pd["models"]
+        models = [m for m in pd["models"] if m.get("status") != "deprecated"]
         if tools: models = [m for m in models if m["tool_call"]]
         if reasoning: models = [m for m in models if m["reasoning"]]
         if context: models = [m for m in models if m["context"] >= context]
@@ -2189,7 +2211,11 @@ class FallbackChain:
     @staticmethod
     def _load() -> dict:
         if FALLBACK_PATH.exists():
-            try: return json.loads(FALLBACK_PATH.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(FALLBACK_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+                return {}
             except: pass
         return {}
 
@@ -4345,6 +4371,7 @@ def interactive_menu():
         ("-- [cyan]EXTRAS[/] --",                          'header'),
         ("Providers & API Status",                          'providers'),
         ("Provider Health Check",                           'health'),
+        ("Clean Invalid Providers",                         'clean'),
         ("Token Budget Planner",                            'budget'),
         ("Verify Config",                                   'verify'),
         ("Restore Backup",                                  'restore'),
@@ -4438,7 +4465,7 @@ def interactive_menu():
             with console.status("[yellow]Fetching model catalog...[/]"):
                 cat, _ = get_user_models()
             if not cat: console.print("  [red]Could not fetch data.[/]"); press_any(); continue
-            configured = [m for k, pd in cat.items() if pd["configured"] for m in pd["models"]]
+            configured = [m for k, pd in cat.items() if pd["configured"] for m in pd["models"] if m.get("status") != "deprecated"]
             if not configured: console.print("  [red]No configured providers.[/]"); press_any(); continue
             configured.sort(key=lambda x: x["input_price"] + x["output_price"])
             main_candidates = [m for m in configured if m["tool_call"]]
@@ -4477,13 +4504,28 @@ def interactive_menu():
             with console.status("[yellow]Checking provider availability..."):
                 catalog, _ = get_user_models()
             console.print("\n  [yellow]Practical Saver[/]\n")
-            console.print("  1. Free-tier mode (prefer free models, preserve limited tokens)")
+            console.print("  1. Free-tier mode (prefer free models, save limited token quota)")
             console.print("  2. Paid mode (cap paid model cost)")
             ch = input("  Choice: ").strip()
             mode = "free" if ch == "1" else "paid"
-            max_cost_raw = input("  Max paid $/M input+output [5.0]: ").strip()
-            try: max_cost = float(max_cost_raw) if max_cost_raw else 5.0
-            except: max_cost = 5.0
+            if mode == "free":
+                token_limit_raw = input("  Daily token limit [100k]: ").strip()
+                token_limit_raw = token_limit_raw.lower().replace(",", "")
+                multiplier = 1
+                if token_limit_raw.endswith("k"):
+                    multiplier = 1000; token_limit_raw = token_limit_raw[:-1]
+                elif token_limit_raw.endswith("m"):
+                    multiplier = 1000000; token_limit_raw = token_limit_raw[:-1]
+                elif token_limit_raw.endswith("b"):
+                    multiplier = 1000000000; token_limit_raw = token_limit_raw[:-1]
+                try: token_limit = int(float(token_limit_raw) * multiplier) if token_limit_raw else 100000
+                except: token_limit = 100000
+                max_cost = 5.0
+            else:
+                max_cost_raw = input("  Max paid $/M input+output [5.0]: ").strip()
+                try: max_cost = float(max_cost_raw) if max_cost_raw else 5.0
+                except: max_cost = 5.0
+                token_limit = 100000
             provider = input("  Provider filter [any]: ").strip() or None
             if catalog:
                 configured = get_configured_providers()
@@ -4507,7 +4549,7 @@ def interactive_menu():
                     console.print("\n  [dim]Example: set GROQ_API_KEY=your_key or OPENAI_API_KEY=your_key[/]")
                     console.print("  [dim]Then run this tool again.[/]")
                     press_any(); continue
-            save_money.callback(save_mode=mode, task="coding", max_paid_cost=max_cost, daily_budget=1.0, free_token_limit=100000, provider=provider, apply=True, no_proxy=False)
+            save_money.callback(save_mode=mode, task="coding", max_paid_cost=max_cost, daily_budget=1.0, free_token_limit=token_limit, provider=provider, apply=True, no_proxy=False)
             press_any()
 
         elif action == 'auto_setup':
@@ -4518,7 +4560,7 @@ def interactive_menu():
             if not catalog:
                 console.print("  [red]Could not fetch model data.[/]")
                 press_any(); continue
-            configured_list = [m for k, pd in catalog.items() if pd["configured"] for m in pd["models"]]
+            configured_list = [m for k, pd in catalog.items() if pd["configured"] for m in pd["models"] if m.get("status") != "deprecated"]
             if not configured_list:
                 console.print("  [yellow]No configured providers detected.\n")
                 console.print("  [yellow]Please add an API key first via environment variable or /connect in opencode.\n")

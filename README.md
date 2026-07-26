@@ -232,7 +232,7 @@ python token-saver.py save-money --mode paid --provider openai --apply
 python token-saver.py save-money --mode paid --apply --no-proxy
 ```
 
-`free` mode prefers configured free models first and stores a soft free-tier token limit.
+`free` mode prefers configured free models first and stores a soft free-tier token limit (e.g., 500K-1M tokens/month). This preserves your limited token quota for when you need it most.
 `paid` mode caps paid candidates by input+output price per million tokens, sets a cheaper small model, enables compaction, and creates fallback chains away from expensive models.
 
 ### Cache Management
