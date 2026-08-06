@@ -236,7 +236,7 @@ async function loadOverview(){
     setCard('ov-cache',[['Cached Files',d.cache.cached_files||0],['Total Saved',(d.cache.total_savings_tokens||0).toLocaleString()+' tokens','green'],['Compression',(d.cache.total_savings_pct||0).toFixed(1)+'%','yellow']]);
     setCard('ov-savings',[['Entries',d.savings.total_entries||0],['Total Saved',(d.savings.total_saved_tokens||0).toLocaleString()+' tokens','green'],['Compression',(d.savings.compression_pct||0)+'%','yellow']]);
     const pStat=d.proxy.running?'green':'red';const pTxt=d.proxy.running?'Running':'Stopped';
-    setCard('ov-proxy',[['Status','<span class="status-dot '+pStat+'"></span>'+pTxt],['Port',d.proxy.port||'-'],['Requests',d.proxy.requests_served||0],['Tokens Saved','<span class="green">'+(d.proxy.total_saved_tokens||0).toLocaleString()+'</span>']]);
+    setCard('ov-proxy',[['Status','<span class="status-dot '+pStat+'"></span>'+pTxt],['Port',d.proxy.port||'-'],['Requests',d.proxy.requests_served||0],['Tokens Saved','<span class="green">'+(d.proxy.total_saved_tokens||0).toLocaleString()+'</span>'],['FROST Saved','<span class="green">'+(d.proxy.frost_total_saved_tokens||0).toLocaleString()+'</span>']]);
     setCard('ov-budget',[['Plan Active',d.budget.has_plan?'Yes':'No'],['Budget Limit',(d.budget.budget_limit||0).toLocaleString()],['Allocated',(d.budget.total_allocated||0).toLocaleString()]]);
     setCard('ov-store',[['Entries',d.store.entries||0],['Total Bytes',(d.store.total_bytes||0).toLocaleString()]]);
     setCard('ov-fallback',[['Chains',d.fallback.chains||0]]);

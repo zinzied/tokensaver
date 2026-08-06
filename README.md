@@ -1,6 +1,6 @@
 # Token Saver CLI v9.5
 
-Reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress file reads and shell output, cache re-reads, run a request compression proxy, and track savings with a tamper-evident ledger. Now with **SQLite FTS5 search**, **MCP server**, and **agent skill installer**.
+Reduce token waste and spending when using AI coding models. Compare pricing across **all providers**, compress file reads and shell output, cache re-reads, run a request compression proxy, and track savings with a tamper-evident ledger. Now with **FROST system-prompt freeze**, **SQLite FTS5 search**, **MCP server**, and **agent skill installer**.
 
 **Inspired by [lean-ctx](https://github.com/yvgude/lean-ctx)** and [ctxrs/ctx](https://github.com/ctxrs/ctx) — context engineering + agent history search.  
 **Advanced features** (RTK compression, caveman mode, format translation, quota tracking, multi-account routing) draw on proven ideas from the open-source routing gateway ecosystem.
@@ -45,6 +45,14 @@ Reduce token waste and spending when using AI coding models. Compare pricing acr
 - Compresses message content (system prompts, user messages, tool results)
 - Tracks per-request savings in real-time
 - Port: 8199 (configurable)
+
+#### FROST — System Prompt Freeze (NEW)
+- **The single biggest per-turn waste in every agent session**: the client re-sends the full system prompt (typically 5–15k tokens) on *every single request*.
+- FROST sends the system prompt **once per session**, then swaps an unchanged copy for a ~6-token marker — the model keeps the full text in its own context from earlier turns, so nothing is lost.
+- **50-turn session with a 9k-token system prompt → ~440,000 tokens saved** (~35-40% of total input).
+- **Provably safe**: only replaces when the system text is byte-identical (SHA256) AND fewer than `refresh_after_tokens` (default 50k) non-system tokens have flowed since the last full send AND the conversation hasn't shrunk (no compaction). Any miss → full prompt re-sent.
+- Works through the proxy → compatible with **any** OpenAI/Anthropic-format client (OpenCode, Claude Code, Cursor, VS Code).
+- Runs even on very large conversations where content compression is skipped.
 
 #### Content-Addressed Store
 - **SHA256-based content addressing** for reversible compression
@@ -146,7 +154,7 @@ python token-saver.py
 ```bash
 python token-saver.py                              # Interactive menu
 python token-saver.py set cheapest                 # Quick-set model tier
-python token-saver.py save-max                     # One-command full optimization (cheapest models, compaction, fallbacks, proxy)
+python token-saver.py save-max                     # One-command full optimization (cheapest models, compaction, fallbacks, proxy, FROST)
 python token-saver.py save-max --no-proxy          # Same but skip the proxy
 python token-saver.py save-money --mode free       # Prefer free models and preserve limited free-tier tokens
 python token-saver.py save-money --mode paid --max-paid-cost 5 --apply  # Cap paid model spend and apply
@@ -253,6 +261,17 @@ python token-saver.py proxy start --generic --provider openai
 python token-saver.py proxy env --provider openai
 ```
 
+### FROST — System Prompt Freeze (NEW)
+```bash
+python token-saver.py frost on                     # Enable FROST in the proxy
+python token-saver.py frost on --refresh-after-tokens 30000   # Smaller safety window
+python token-saver.py frost off                    # Disable
+python token-saver.py frost status                 # Status + total tokens saved
+python token-saver.py frost test "<system prompt>" '[{"role":"user","content":"hi"}]'  # Dry-run
+python token-saver.py proxy start --no-frost       # Force FROST off for one proxy run
+```
+`save-max` enables FROST automatically. The proxy replaces an unchanged system prompt with a small marker after the first request of each session, and re-sends the full prompt whenever the system text changes, the conversation compacts, or the safety window (50k non-system tokens by default) is crossed.
+
 For VS Code extensions, Hermes, custom scripts, or any OpenAI-compatible CLI, set the client base URL to:
 
 ```text
@@ -353,7 +372,7 @@ python token-saver.py dashboard stop                  # Stop dashboard
 ```
 Open http://127.0.0.1:8200 in your browser for a comprehensive 9-page dashboard:
 
-- **Overview** — Total savings, cache stats, proxy status, quota tracking
+- **Overview** — Total savings (incl. FROST), cache stats, proxy status, quota tracking
 - **Usage** — Provider request volume, tokens in/out, estimated savings
 - **Quota** — Per-provider quota usage, reset countdowns, rate limit status
 - **Translator** — Format translation debug tool (OpenAI ↔ Claude ↔ Gemini)
@@ -377,7 +396,7 @@ Run without subcommand to see the full interactive menu:
   +==================================================+
   |  OpenCode Token Saver CLI v9.5              |
   |  Compare - Compress - Cache - Proxy - Search     |
-  |  RTK + Caveman + Translation + Routing + Quota  |
+  |  RTK + Caveman + FROST + Routing + Quota        |
   +==================================================+
 
   Current Status
@@ -409,22 +428,23 @@ Run without subcommand to see the full interactive menu:
      15. Start Compression Proxy
      16. Stop Proxy
      17. Proxy Status
+     18. FROST System Prompt Freeze
       -- ADVANCED TOOLS --
-     18. RTK Tool-Result Compression
-     19. Caveman Mode (terse output)
-     20. Ponytail Mode (lazy dev)
-     21. Format Translation (OpenAI↔Claude)
-     22. 3-Tier Fallback Routing
-     23. Quota Tracking
-     24. Multi-Account Manager
-     25. Auto Token Refresh
+     19. RTK Tool-Result Compression
+     20. Caveman Mode (terse output)
+     21. Ponytail Mode (lazy dev)
+     22. Format Translation (OpenAI↔Claude)
+     23. 3-Tier Fallback Routing
+     24. Quota Tracking
+     25. Multi-Account Manager
+     26. Auto Token Refresh
       -- EXTRAS --
-     26. Providers & API Status
-     27. Provider Health Check
-     28. Token Budget Planner
-     29. Verify Config
-     30. Restore Backup
-     31. Exit
+     27. Providers & API Status
+     28. Provider Health Check
+     29. Token Budget Planner
+     30. Verify Config
+     31. Restore Backup
+     32. Exit
 ```
 
 ## Compression Benchmarks

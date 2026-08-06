@@ -173,6 +173,45 @@ def get_providers_from_model_history() -> list[str]:
             except: pass
     return sorted(providers)
 
+def get_providers_from_auth() -> list[str]:
+    """Providers with credentials stored in opencode's auth.json (api keys)."""
+    detected = set()
+    for p in [Path.home() / ".local" / "share" / "opencode" / "auth.json",
+              Path.home() / ".config" / "opencode" / "auth.json"]:
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            for pid, entry in data.items():
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "api" and entry.get("key"):
+                    detected.add(pid)
+                elif entry.get("type") in ("oauth", "refresh") and entry.get("refresh"):
+                    detected.add(pid)
+        except: pass
+    return sorted(detected)
+
+def get_current_model() -> str:
+    """The actual model opencode is using right now (most recent in state), falling
+    back to the config `model` field."""
+    for p in [CONFIG_PATH.parent.parent / "state" / "opencode" / "model.json",
+              Path.home() / ".local" / "state" / "opencode" / "model.json"]:
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                recent = data.get("recent", []) or []
+                if recent and isinstance(recent[0], dict):
+                    pid = recent[0].get("providerID", "")
+                    mid = recent[0].get("modelID", "")
+                    if pid and mid:
+                        return f"{pid}/{mid}"
+            except: pass
+    cfg = read_config() or {}
+    return cfg.get("model", "") or cfg.get("small_model", "") or ""
+
 def get_providers_from_catalog_crossref() -> list[str]:
     detected = set()
     catalog = None
@@ -745,6 +784,7 @@ PROVIDER_DEFAULT_BASE_URLS = {
 # may live at a different host/path.
 INFERENCE_BASE_URL_OVERRIDES: dict[str, str] = {
     "huggingface": "https://api-inference.huggingface.co/v1",
+    "nvidia": "https://integrate.api.nvidia.com/v1",
 }
 # Apply overrides on top of the default map
 PROVIDER_DEFAULT_BASE_URLS.update(INFERENCE_BASE_URL_OVERRIDES)
@@ -1046,6 +1086,12 @@ def save_max(no_proxy: bool):
             steps.append(("Proxy", "already running"))
         elif CompressionProxy.start_server():
             steps.append(("Proxy", "started (adaptive — works with any provider)"))
+        # FROST: freeze the system prompt — the biggest per-turn waste in every session.
+        pcfg = CompressionProxy.config()
+        pcfg.setdefault("frost", {})["enabled"] = True
+        pcfg["frost"].setdefault("refresh_after_tokens", 50000)
+        CompressionProxy.save_config(pcfg)
+        steps.append(("FROST", "system-prompt freeze ON (saves ~5-15k tokens/turn)"))
     tbl = Table(box=box.SIMPLE, show_header=False)
     tbl.add_column("Setting", style="cyan"); tbl.add_column("Value", style="green")
     for label, val in steps: tbl.add_row(f"  {label}", val)
@@ -2336,30 +2382,67 @@ class CompressionProxy:
         proxy_url = f"http://127.0.0.1:{port}/v1"
         proxy_meta = CompressionProxy.config()
         proxy_meta.setdefault("saved_base_urls", {})
+
+        # 1) Rewrite baseURL for providers already in the config file. Refresh the
+        #    cached real upstream URL for EVERY provider (even ones already pointing
+        #    at the proxy) so URL overrides stay correct across restarts.
+        existing = set(oc_cfg.get("provider", {}).keys())
         for pid, pconf in oc_cfg.get("provider", {}).items():
             if isinstance(pconf, dict):
                 opts = pconf.get("options", {}) or {}
                 orig = opts.get("baseURL", "")
-                # Skip if already pointing at this proxy (don't save proxy URL as real upstream)
-                if orig and f"127.0.0.1:{port}" in orig:
-                    continue
-                # Even if already pointing at the proxy, refresh the cached
-                # upstream URL so it stays correct across restarts.
                 real_url = PROVIDER_DEFAULT_BASE_URLS.get(pid, "")
                 if real_url and f"127.0.0.1:{port}" not in real_url:
                     proxy_meta["saved_base_urls"][pid] = real_url
                 elif orig and f"127.0.0.1:{port}" not in orig:
                     proxy_meta["saved_base_urls"][pid] = orig
+                if orig and f"127.0.0.1:{port}" in orig:
+                    continue
                 if "options" not in pconf or pconf["options"] is None:
                     pconf["options"] = {}
                 pconf["options"]["baseURL"] = proxy_url
+
+        # 2. Auto-add ALL providers that actually have credentials (env vars OR
+        #    opencode auth.json) to the config and route them through the proxy.
+        #    Never hijack providers that have no working credentials.
+        env_providers = set(get_providers_from_env())
+        env_providers.update(get_providers_from_auth())
+        cur_model = (oc_cfg.get("model", "") or "").split("/")[0]
+        if cur_model:
+            env_providers.add(cur_model)
+        added_count = 0
+        added_providers = set(proxy_meta.setdefault("added_providers", []))
+        for pid in sorted(env_providers):
+            if pid in existing:
+                continue
+            if pid not in PROVIDER_DEFAULT_BASE_URLS:
+                continue
+            real_url = PROVIDER_DEFAULT_BASE_URLS[pid]
+            if f"127.0.0.1:{port}" in real_url:
+                continue
+            if pid not in oc_cfg.setdefault("provider", {}):
+                oc_cfg["provider"][pid] = {}
+            pconf = oc_cfg["provider"][pid]
+            if not isinstance(pconf, dict):
+                oc_cfg["provider"][pid] = pconf = {}
+            pconf.setdefault("options", {})
+            pconf["options"]["baseURL"] = proxy_url
+            proxy_meta["saved_base_urls"][pid] = real_url
+            added_providers.add(pid)
+            added_count += 1
+        proxy_meta["added_providers"] = sorted(added_providers)
+
         compressed_pids = [pid for pid in oc_cfg.get("provider", {}) if isinstance(oc_cfg["provider"][pid], dict) and oc_cfg["provider"][pid].get("options", {}).get("baseURL") == proxy_url]
         if compressed_pids:
+            proxy_meta["proxied_providers"] = sorted(compressed_pids)
+            proxy_meta["upstreams"] = {pid: proxy_meta["saved_base_urls"].get(pid, "") for pid in compressed_pids}
             text = json.dumps(oc_cfg, indent=2)
             CONFIG_PATH.write_text(text + '\n', encoding="utf-8")
             proxy_meta["saved_base_urls"] = {pid: proxy_meta["saved_base_urls"].get(pid, "") for pid in compressed_pids}
             CompressionProxy.save_config(proxy_meta)
             console.print(f"  [green]  -> Auto-configured {len(compressed_pids)} provider(s) to use proxy: {', '.join(compressed_pids)}[/]")
+            if added_count > 0:
+                console.print(f"  [green]  -> Added {added_count} env-var provider(s) to config: {', '.join(sorted(p for p in compressed_pids if p not in existing))}[/]")
             console.print("  [green]  -> Restart OpenCode for changes to take effect.[/]")
         else:
             # If no providers in config, try to infer from model field
@@ -2377,6 +2460,8 @@ class CompressionProxy:
                     proxy_meta["saved_base_urls"][inferred_pid] = real_url
                 pconf.setdefault("options", {})
                 pconf["options"]["baseURL"] = proxy_url
+                proxy_meta["proxied_providers"] = [inferred_pid]
+                proxy_meta["upstream_base"] = {inferred_pid: proxy_meta["saved_base_urls"].get(inferred_pid, "")}
                 text = json.dumps(oc_cfg, indent=2)
                 CONFIG_PATH.write_text(text + "\n", encoding="utf-8")
                 CompressionProxy.save_config(proxy_meta)
@@ -2515,7 +2600,7 @@ class CompressionProxy:
         CompressionProxy.save_config(proxy_meta)
 
     @staticmethod
-    def start_server(port: int = None, provider: str | None = None, configure_opencode: bool = True) -> bool:
+    def start_server(port: int = None, provider: str | None = None, configure_opencode: bool = True, no_frost: bool = False) -> bool:
         cfg = CompressionProxy.config()
         if cfg.get("enabled") and cfg.get("pid"):
             console.print("  [yellow]Proxy is already running.[/]"); return False
@@ -2538,6 +2623,7 @@ try:
     import requests as _req
 except Exception:
     _req = None
+_FROST_OFF = False  # forced off by `proxy start --no-frost`
 # Shared session for connection pooling + Cloudflare bypass + retry
 _session = None
 def _get_session():
@@ -2581,7 +2667,98 @@ def _cost_level(mid):
     if total < 2: return "cheap"
     if total < 20: return "moderate"
     return "expensive"
+# --- FROST: System Prompt Freeze --------------------------------------
+# The client re-sends the full system prompt on every single request. FROST
+# sends it once per session, then swaps an unchanged copy for a tiny marker —
+# the model keeps the full text in its own context from the earlier turns.
+# Safety: only replace while (a) the system text is byte-identical (SHA256) to
+# what we sent last for this session, (b) fewer than refresh_after_tokens of
+# non-system tokens have flowed since the last full send (so the full prompt is
+# guaranteed still in the model's window), and (c) the conversation did not
+# shrink (no compaction/reset). Any miss -> full prompt re-sent.
+_FROST_MARKER = "[FROST] system prompt unchanged - instructions from earlier in this conversation still apply."
+_FROST_DEFAULT_THRESHOLD = 50000
+
+def _frost_cfg():
+    try:
+        with open(str(pathlib.Path.home() / ".config" / "opencode" / "compress" / "proxy.json"), encoding="utf-8") as f:
+            return (json.load(f).get("frost") or {}) or {}
+    except Exception:
+        return {}
+
+def _frost_session_key(model_id, msgs):
+    """Session identity = model + first non-system message (stable across turns)."""
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") == "system":
+            continue
+        seed = json.dumps({"role": m.get("role"), "content": m.get("content")}, separators=(",", ":"))
+        return hashlib.sha256((model_id + seed).encode("utf-8")).hexdigest()
+    return ""
+
+def _frost_system(data, path_only):
+    """Return (kind, value) for the system block: 'openai'|'anthropic'|None."""
+    p = path_only.split("?", 1)[0]
+    if (p.endswith("/messages") or data.get("system") is not None) and data.get("system") is not None:
+        return ("anthropic", data["system"])
+    msgs = data.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "system":
+                return ("openai", m.get("content", ""))
+    return (None, None)
+
+def _frost_replace(data, path_only, marker):
+    kind, val = _frost_system(data, path_only)
+    if kind == "openai":
+        for m in data.get("messages", []):
+            if isinstance(m, dict) and m.get("role") == "system":
+                m["content"] = marker
+                return len(val) if isinstance(val, str) else len(json.dumps(val, ensure_ascii=False))
+    elif kind == "anthropic":
+        data["system"] = marker
+        return len(val) if isinstance(val, str) else len(json.dumps(val, ensure_ascii=False))
+    return 0
+
+def _frost_apply(data, model_id, path_only):
+    """Replace unchanged system prompt with a marker. Returns chars saved (0 if not applied)."""
+    if _FROST_OFF or not isinstance(data, dict):
+        return 0
+    kind, val = _frost_system(data, path_only)
+    if not kind:
+        return 0
+    msgs = data.get("messages")
+    if not isinstance(msgs, list):
+        return 0
+    sess = _frost_session_key(model_id, msgs)
+    if not sess:
+        return 0
+    try:
+        sys_text = val if isinstance(val, str) else json.dumps(val, separators=(",", ":"), ensure_ascii=False)
+    except Exception:
+        return 0
+    sys_hash = hashlib.sha256(sys_text.encode("utf-8")).hexdigest()
+    fcfg = _frost_cfg()
+    if not fcfg.get("enabled", False):
+        return 0
+    threshold = int(fcfg.get("refresh_after_tokens", _FROST_DEFAULT_THRESHOLD))
+    non_sys = sum(len(json.dumps(m.get("content", ""), ensure_ascii=False)) // 4
+                  for m in msgs if isinstance(m, dict) and m.get("role") != "system")
+    n_msgs = len(msgs)
+    st = PH._frost.get(sess)
+    if st and st.get("sys_hash") == sys_hash and st.get("since_tokens", 0) < threshold and n_msgs >= st.get("last_msgs", 0):
+        saved_chars = _frost_replace(data, path_only, _FROST_MARKER)
+        st["since_tokens"] = st.get("since_tokens", 0) + non_sys
+        st["last_msgs"] = n_msgs
+        PH._frost_total += saved_chars // 4
+        return saved_chars // 4
+    PH._frost[sess] = {"sys_hash": sys_hash, "since_tokens": non_sys, "last_msgs": n_msgs}
+    if len(PH._frost) > 50:
+        for k in list(PH._frost)[:25]:
+            PH._frost.pop(k, None)
+    return 0
 class PH(http.server.BaseHTTPRequestHandler):
+    _frost = {}
+    _frost_total = 0
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
@@ -2589,6 +2766,7 @@ class PH(http.server.BaseHTTPRequestHandler):
         nb = body
         model_id = ""
         _orig_model = ""
+        _frost_saved = 0
         try:
             data = json.loads(body)
             msgs = data.get("messages", [])
@@ -2606,6 +2784,12 @@ class PH(http.server.BaseHTTPRequestHandler):
             # Skip compression for very large conversations (>50 msgs or >100KB)
             # to avoid corrupting tool calls and complex content structures.
             _skip_compress = len(msgs) > 50 or len(body) > 100000
+            # FROST: collapse an unchanged system prompt to a marker. Runs before
+            # the content pipeline and applies even to very large conversations.
+            try:
+                _frost_saved = _frost_apply(data, model_id, self.path)
+            except Exception:
+                _frost_saved = 0
             comp = []
             # 1) JSON Crusher: statistical JSON array compression
             # 2) Log Compressor: deduplicate repetitive log lines
@@ -2743,9 +2927,63 @@ class PH(http.server.BaseHTTPRequestHandler):
         # Per-request upstream override — adapt to the provider the model belongs to
         try:
             _mp = _orig_model.split("/")[0] if _orig_model and "/" in _orig_model else ""
+            _routed = False
             if _mp and _mp in _CONFIGURED_PROVIDERS and _mp in _PROVIDER_UPSTREAM:
                 _mu = _PROVIDER_UPSTREAM[_mp]
                 if _mu and f"127.0.0.1:{_PROXY_PORT}" not in _mu:
+                    if path_only.endswith("/chat/completions"):
+                        upstream = _mu + "/chat/completions"
+                    elif path_only.endswith("/messages"):
+                        upstream = _mu + "/messages"
+                    elif path_only.endswith("/models"):
+                        upstream = _mu + "/models"
+                    _routed = True
+            if not _routed and _orig_model:
+                # Fallback: opencode may send the bare model id (without the
+                # provider prefix). Match it against the models.dev catalog so a
+                # model like "deepseek-ai/deepseek-v4-pro" routes to nvidia
+                # instead of the default upstream.
+                _cands = [p for p in _MODEL_PROVIDER.get(_orig_model, [])
+                          if p in _CONFIGURED_PROVIDERS and p in _PROVIDER_UPSTREAM
+                          and f"127.0.0.1:{_PROXY_PORT}" not in (_PROVIDER_UPSTREAM[p] or "")]
+                if _cands:
+                    _pick = _cands[0] if len(_cands) == 1 else None
+                    if not _pick:
+                        # Tiebreak 1: Authorization header key signature
+                        _auth = self.headers.get("Authorization", "") or ""
+                        _key = _auth.split(" ", 1)[-1].strip() if _auth else ""
+                        for _pfx, _pp in _KEY_PREFIX_PROVIDER:
+                            if _key.startswith(_pfx) and _pp in _cands:
+                                _pick = _pp
+                                break
+                    if not _pick:
+                        # Tiebreak 2: current model's provider (opencode state/config)
+                        try:
+                            _stp = pathlib.Path.home() / ".local" / "state" / "opencode" / "model.json"
+                            if not _stp.exists():
+                                _stp = pathlib.Path.home() / ".config" / "state" / "opencode" / "model.json"
+                            _cur_id = ""
+                            if _stp.exists():
+                                _st = json.load(open(_stp, encoding="utf-8"))
+                                _r0 = (_st.get("recent") or [{}])[0]
+                                if _r0.get("providerID") and _r0.get("modelID"):
+                                    _cur_id = _r0["providerID"] + "/" + _r0["modelID"]
+                            if not _cur_id:
+                                _cg2 = pathlib.Path.home() / ".config" / "opencode" / "opencode.jsonc"
+                                if not _cg2.exists():
+                                    _cg2 = pathlib.Path.home() / ".config" / "opencode" / "opencode.json"
+                                if _cg2.exists():
+                                    _ct2 = re.sub(r'^\s*//.*', '', _cg2.read_text("utf-8"), flags=re.MULTILINE)
+                                    _ct2 = re.sub(r'/\*[\s\S]*?\*/', '', _ct2)
+                                    _cj = json.loads(_ct2)
+                                    _cur_id = _cj.get("model", "") or ""
+                            _cp = _cur_id.split("/")[0] if "/" in _cur_id else ""
+                            if _cp in _cands:
+                                _pick = _cp
+                        except: pass
+                    if not _pick:
+                        _pick = _cands[0]
+                    _mu = _PROVIDER_UPSTREAM[_pick]
                     if path_only.endswith("/chat/completions"):
                         upstream = _mu + "/chat/completions"
                     elif path_only.endswith("/messages"):
@@ -2795,7 +3033,7 @@ class PH(http.server.BaseHTTPRequestHandler):
                     lf.write(msg + "\\n")
             except Exception:
                 pass
-        _plog("REQ path=%s model_orig=%s model_fwd=%s raw_sz=%d comp_sz=%d msgs=%d" % (self.path, _orig_model, model_id, len(body), len(nb), len(data.get("messages",[])) if isinstance(data, dict) else 0))
+        _plog("REQ path=%s model_orig=%s model_fwd=%s raw_sz=%d comp_sz=%d msgs=%d frost_saved=%d" % (self.path, _orig_model, model_id, len(body), len(nb), len(data.get("messages",[])) if isinstance(data, dict) else 0, _frost_saved))
         try:
             _sess = _get_session()
             if _sess is not None:
@@ -2889,9 +3127,10 @@ class PH(http.server.BaseHTTPRequestHandler):
         try:
             with open(cf) as f: cg = json.load(f)
         except: cg = {}
-        cg.setdefault("history",[]).append({"path":path_only,"model":_orig_model or model_id or "unknown","saved_tokens":saved,"timestamp":__import__("time").time()})
+        cg.setdefault("history",[]).append({"path":path_only,"model":_orig_model or model_id or "unknown","saved_tokens":saved,"frost_saved":_frost_saved,"timestamp":__import__("time").time()})
         cg["history"] = cg["history"][-200:]
         cg["total_saved_tokens"] = cg.get("total_saved_tokens",0) + saved
+        cg["frost_total_saved_tokens"] = cg.get("frost_total_saved_tokens",0) + _frost_saved
         try:
             with open(cf,"w") as f: json.dump(cg,f,indent=2)
         except: pass
@@ -3017,6 +3256,7 @@ def setup_upstream(port, cfg):
 setup_upstream(''' + str(port) + r''', ''' + repr({"provider": provider or "", "upstream": ""}) + r''')
 # Per-request upstream resolution for multi-provider support
 _PROXY_PORT = ''' + str(port) + r'''
+_FROST_OFF = ''' + ("True" if no_frost else "False") + r'''
 _PROVIDER_UPSTREAM = {}
 _CONFIGURED_PROVIDERS = set()
 # 1) From saved_base_urls (original upstreams recorded before proxy rewrites)
@@ -3082,6 +3322,33 @@ if not UPSTREAM_MAP.get("__base__", ""):
             UPSTREAM_MAP["/v1/models"] = _mu + "/models"
             UPSTREAM_MAP["/models"] = _mu + "/models"
             break
+# 6) Build a model->provider map from the models.dev cache so bare model ids
+#    (e.g. "deepseek-ai/deepseek-v4-pro") can be routed to the right provider.
+# Distinctive API-key prefixes used to disambiguate when several configured
+# providers expose the same model key (more specific prefixes must come first).
+_KEY_PREFIX_PROVIDER = [
+    ("nvapi-", "nvidia"),
+    ("sk-ant-", "anthropic"),
+    ("hf_", "huggingface"),
+    ("sk-or-v1", "openrouter"),
+    ("AIza", "google"),
+    ("gsk_", "groq"),
+    ("tgp_v1_", "together"),
+]
+_MODEL_PROVIDER = {}
+try:
+    _cache_path = pathlib.Path.home() / ".config" / "opencode" / "models_cache.json"
+    if _cache_path.exists():
+        _cat = json.load(open(_cache_path, encoding="utf-8"))
+        for _pid, _pdata in (_cat or {}).items():
+            if not isinstance(_pdata, dict):
+                continue
+            _models = _pdata.get("models", {})
+            if not isinstance(_models, dict):
+                continue
+            for _mkey in _models.keys():
+                _MODEL_PROVIDER.setdefault(_mkey, []).append(_pid)
+except: pass
 # Validate upstream is reachable before accepting traffic
 _base = UPSTREAM_MAP.get("__base__", "")
 if _base:
@@ -3191,12 +3458,44 @@ Server(("127.0.0.1",''' + str(port) + r'''),PH).serve_forever()
                 models.setdefault(m, {"tokens": 0, "requests": 0})
                 models[m]["tokens"] += h.get("saved_tokens", 0)
                 models[m]["requests"] += 1
+        port = cfg.get("port", CompressionProxy.PROXY_PORT)
+        proxy_url = f"http://127.0.0.1:{port}/v1"
+        oc_cfg = read_config() or {}
+        proxied = set(cfg.get("proxied_providers", []))
+        upstreams = dict(cfg.get("upstreams", {}) or {})
+        saved_urls = dict(cfg.get("saved_base_urls", {}) or {})
+        for p in upstreams:
+            if p not in saved_urls:
+                saved_urls[p] = upstreams[p]
+        for pid, pconf in (oc_cfg.get("provider", {}) or {}).items():
+            if not isinstance(pconf, dict):
+                continue
+            opts = pconf.get("options", {}) or {}
+            bu = opts.get("baseURL", "")
+            if bu and proxy_url in bu:
+                proxied.add(pid)
+                if pid not in saved_urls:
+                    saved_urls[pid] = PROVIDER_DEFAULT_BASE_URLS.get(pid, "")
+        all_configured = set(get_providers_from_env())
+        all_configured.update(get_providers_from_auth())
+        cur_provider = (oc_cfg.get("model", "") or "").split("/")[0]
+        if cur_provider:
+            all_configured.add(cur_provider)
+        for pid in list(proxied):
+            if pid not in all_configured:
+                proxied.remove(pid)
+        not_proxied = sorted(p for p in all_configured
+                             if p in PROVIDER_DEFAULT_BASE_URLS and p not in proxied)
         return {
             "enabled": cfg.get("enabled", False), "running": running,
-            "port": cfg.get("port", CompressionProxy.PROXY_PORT), "pid": cfg.get("pid"),
+            "port": port, "pid": cfg.get("pid"),
             "total_saved_tokens": cfg.get("total_saved_tokens", 0),
             "requests_served": len(history),
             "models": models,
+            "current_model": get_current_model(),
+            "proxied_providers": sorted(proxied),
+            "upstreams": {p: saved_urls.get(p, "") for p in sorted(proxied)},
+            "not_proxied_providers": not_proxied,
         }
 
 class DashboardServer:
@@ -3526,10 +3825,13 @@ def print_proxy_env(port: int, provider: str):
 @click.option("--port", "-p", default=8199, type=int, help="Port")
 @click.option("--provider", help="Provider upstream for generic mode, e.g. openai, anthropic, deepseek, openrouter")
 @click.option("--generic", is_flag=True, help="Do not rewrite OpenCode config; print settings for any OpenAI-compatible client")
-def proxy_start(port: int, provider: str | None, generic: bool):
+@click.option("--no-frost", is_flag=True, help="Disable FROST system-prompt freeze for this proxy run")
+def proxy_start(port: int, provider: str | None, generic: bool, no_frost: bool):
     """Start the compression proxy server (auto-detects provider from model names)"""
     console.clear(); banner()
     console.print(f"\n  [yellow]Starting compression proxy on port {port}...[/]")
+    if no_frost:
+        console.print("  [dim]  FROST system-prompt freeze disabled for this run.[/]")
     if generic and not provider:
         console.print("  [red]Generic mode needs --provider so the proxy knows the real upstream.[/]")
         console.print("  [dim]Example: python token-saver.py proxy start --generic --provider openai[/]")
@@ -3538,7 +3840,7 @@ def proxy_start(port: int, provider: str | None, generic: bool):
         console.print(f"  [red]Unknown provider: {provider}[/]")
         console.print("  [dim]Run `python token-saver.py providers` to see detected providers.[/]")
         return
-    if CompressionProxy.start_server(port, provider=provider, configure_opencode=not generic) and generic:
+    if CompressionProxy.start_server(port, provider=provider, configure_opencode=not generic, no_frost=no_frost) and generic:
         print_proxy_env(port, provider)
 
 @proxy.command(name="env")
@@ -3561,10 +3863,95 @@ def proxy_status():
     console.print(f"  [cyan]Port:[/] {s['port']}")
     console.print(f"  [cyan]Requests served:[/] {s['requests_served']}")
     if s['total_saved_tokens'] > 0: console.print(f"  [cyan]Total saved:[/] [green]{s['total_saved_tokens']:,} tokens[/]")
+    current_model = s.get("current_model", "")
+    if current_model:
+        pid = current_model.split("/")[0] if "/" in current_model else ""
+        proxied = s.get("proxied_providers", [])
+        is_proxied = pid in proxied if pid else False
+        tag = " [green](proxied)[/]" if is_proxied else " [red](bypassing proxy)[/]"
+        console.print(f"  [cyan]Current model:[/] [bold]{current_model}[/]{tag}")
+    proxied = s.get("proxied_providers", [])
+    if proxied:
+        upstreams = s.get("upstreams", {})
+        console.print(f"\n  [cyan]Proxied providers:[/]")
+        for p in proxied:
+            ups = upstreams.get(p, "")
+            console.print(f"    [cyan]{p}[/] -> {ups}")
+    not_proxied = s.get("not_proxied_providers", [])
+    if not_proxied:
+        console.print(f"\n  [yellow]Env providers NOT proxied:[/]")
+        for p in not_proxied:
+            console.print(f"    [red]{p}[/] [dim](bypasses proxy — restart proxy to fix)[/]")
     if s.get("models"):
-        console.print(f"\n  [cyan]Models:[/]")
+        console.print(f"\n  [cyan]Model history:[/]")
         for model, stats in sorted(s["models"].items(), key=lambda x: -x[1]["tokens"]):
             console.print(f"    [bold]{model}[/]  [dim]{stats['requests']} reqs[/]  [green]{stats['tokens']:,} tokens saved[/]")
+
+@cli.group()
+def frost():
+    """FROST — freeze the system prompt (dedupe repeats across turns)"""
+    pass
+
+@frost.command(name="on")
+@click.option("--refresh-after-tokens", default=50000, type=int, help="Re-send full system prompt after this many non-system tokens (safety window)")
+def frost_on(refresh_after_tokens: int):
+    """Enable FROST in the compression proxy"""
+    cfg = CompressionProxy.config()
+    cfg["frost"] = {"enabled": True, "refresh_after_tokens": refresh_after_tokens}
+    CompressionProxy.save_config(cfg)
+    console.print("\n  [green][OK] FROST enabled.[/]")
+    console.print("  [dim]Restart the proxy (`proxy stop` + `proxy start`) if it is already running.[/]")
+    console.print(f"  [dim]Safety window: re-sends the full system prompt every {refresh_after_tokens:,} non-system tokens.[/]")
+
+@frost.command(name="off")
+def frost_off():
+    """Disable FROST in the compression proxy"""
+    cfg = CompressionProxy.config()
+    cfg.setdefault("frost", {})["enabled"] = False
+    CompressionProxy.save_config(cfg)
+    console.print("\n  [yellow]FROST disabled.[/]")
+    console.print("  [dim]Restart the proxy (`proxy stop` + `proxy start`) if it is already running.[/]")
+
+@frost.command(name="status")
+def frost_status():
+    """Show FROST status and tokens saved"""
+    cfg = CompressionProxy.config()
+    f = cfg.get("frost", {}) or {}
+    enabled = f.get("enabled", False)
+    threshold = f.get("refresh_after_tokens", 50000)
+    total = cfg.get("frost_total_saved_tokens", 0)
+    console.print(f"\n  [cyan]FROST (System Prompt Freeze):[/] {'[green]ON[/]' if enabled else '[red]OFF[/]'}")
+    console.print(f"  [cyan]Safety window:[/] re-send full system after {threshold:,} non-system tokens")
+    console.print(f"  [cyan]Total tokens saved:[/] [green]{total:,}[/]")
+    console.print("  [dim]Works through the compression proxy — send requests via 127.0.0.1:8199.[/]")
+
+@frost.command(name="test")
+@click.argument("system_prompt")
+@click.argument("messages_json")
+def frost_test(system_prompt: str, messages_json: str):
+    """Dry-run: show a first request (full system) then an identical one (marker)"""
+    try:
+        msgs = json.loads(messages_json)
+        if not isinstance(msgs, list):
+            raise ValueError()
+    except Exception:
+        console.print("  [red]messages_json must be a JSON array, e.g. '[{\"role\":\"user\",\"content\":\"hi\"}]'[/]")
+        return
+    body1 = {"model": "test-model", "messages": [{"role": "system", "content": system_prompt}] + msgs}
+    body2 = json.loads(json.dumps(body1))
+    for m in body2["messages"]:
+        if m.get("role") == "system":
+            m["content"] = "[FROST] system prompt unchanged - instructions from earlier in this conversation still apply."
+    t1 = len(json.dumps(body1, separators=(",", ":"))) // 4
+    t2 = len(json.dumps(body2, separators=(",", ":"))) // 4
+    console.print(f"\n  [cyan]FROST dry-run[/]\n")
+    console.print(f"  [cyan]System prompt:[/] {len(system_prompt):,} chars ≈ {len(system_prompt)//4:,} tokens")
+    console.print(f"  [cyan]Request 1:[/] sends full system  →  {t1:,} tokens")
+    console.print(f"  [cyan]Request 2+:[/] sends marker      →  {t2:,} tokens")
+    saved = max(0, t1 - t2)
+    pct = saved / t1 * 100 if t1 else 0
+    console.print(f"\n  [green]Tokens saved per turn: {saved:,} ({pct:.0f}%)[/]")
+    console.print(f"  [dim]In a 50-turn session: {saved*49:,} tokens saved[/]")
 
 @cli.group()
 def budget():
@@ -4357,6 +4744,7 @@ def interactive_menu():
         ("Start Compression Proxy",                         'proxy_start'),
         ("Stop Proxy",                                      'proxy_stop'),
         ("Proxy Status",                                    'proxy_stat'),
+        ("FROST System Prompt Freeze",                      'frost_status'),
         ("",                                                'sep'),
         ("-- [cyan]ADVANCED TOOLS[/] --",                  'header'),
         ("RTK Tool-Result Compression",                     'rtk_test'),
@@ -4643,10 +5031,53 @@ def interactive_menu():
             console.print(f"  [cyan]Requests served:[/] {s['requests_served']}")
             if s['total_saved_tokens'] > 0:
                 console.print(f"  [cyan]Total tokens saved:[/] [green]{s['total_saved_tokens']:,}[/]")
+            current_model = s.get("current_model", "")
+            if current_model:
+                pid = current_model.split("/")[0] if "/" in current_model else ""
+                proxied = s.get("proxied_providers", [])
+                is_proxied = pid in proxied if pid else False
+                tag = " [green](proxied)[/]" if is_proxied else " [red](bypassing proxy)[/]"
+                console.print(f"  [cyan]Current model:[/] [bold]{current_model}[/]{tag}")
+            proxied = s.get("proxied_providers", [])
+            if proxied:
+                upstreams = s.get("upstreams", {})
+                console.print(f"  [cyan]Proxied providers:[/]")
+                for p in proxied:
+                    ups = upstreams.get(p, "")
+                    console.print(f"    [cyan]{p}[/] -> {ups}")
+            not_proxied = s.get("not_proxied_providers", [])
+            if not_proxied:
+                console.print(f"  [yellow]Env providers NOT proxied:[/]")
+                for p in not_proxied:
+                    console.print(f"    [red]{p}[/] [dim](bypasses proxy — restart to fix)[/]")
             if s.get("models"):
-                console.print(f"\n  [cyan]Models:[/]")
+                console.print(f"\n  [cyan]Model history:[/]")
                 for model, stats in sorted(s["models"].items(), key=lambda x: -x[1]["tokens"]):
                     console.print(f"    [bold]{model}[/]  [dim]{stats['requests']} reqs[/]  [green]{stats['tokens']:,} tokens saved[/]")
+            press_any()
+
+        elif action == 'frost_status':
+            console.clear(); banner()
+            cfg = CompressionProxy.config()
+            f = cfg.get("frost", {}) or {}
+            enabled = f.get("enabled", False)
+            threshold = f.get("refresh_after_tokens", 50000)
+            total = cfg.get("frost_total_saved_tokens", 0)
+            console.print(f"\n  [cyan]FROST (System Prompt Freeze):[/] {'[green]ON[/]' if enabled else '[red]OFF[/]'}")
+            console.print(f"  [cyan]Safety window:[/] re-send full system after {threshold:,} non-system tokens")
+            console.print(f"  [cyan]Total tokens saved:[/] [green]{total:,}[/]")
+            console.print(f"\n  [yellow]1.[/] Toggle FROST on")
+            console.print(f"  [yellow]2.[/] Toggle FROST off")
+            console.print(f"  [yellow]Enter.[/] Back")
+            choice = input("\n  Select: ").strip()
+            if choice == "1":
+                cfg["frost"] = {"enabled": True, "refresh_after_tokens": threshold}
+                CompressionProxy.save_config(cfg)
+                console.print("  [green][OK] FROST enabled.[/]  [dim]Restart proxy to apply if running.[/]")
+            elif choice == "2":
+                cfg.setdefault("frost", {})["enabled"] = False
+                CompressionProxy.save_config(cfg)
+                console.print("  [yellow]FROST disabled.[/]  [dim]Restart proxy to apply if running.[/]")
             press_any()
 
         elif action == 'compare':
@@ -5098,12 +5529,37 @@ def interactive_menu():
             console.print(f"  [cyan]Status:[/] {'[green]Running[/]' if s['running'] else '[red]Stopped[/]'}")
             console.print(f"  [cyan]Port:[/] {s['port']}")
             if s['total_saved_tokens'] > 0: console.print(f"  [cyan]Saved:[/] [green]{s['total_saved_tokens']:,} tokens[/]")
+            if s.get("requests_served", 0) > 0: console.print(f"  [cyan]Requests:[/] {s['requests_served']}")
+            current_model = s.get("current_model", "")
+            if current_model:
+                pid = current_model.split("/")[0] if "/" in current_model else ""
+                proxied = s.get("proxied_providers", [])
+                is_proxied = pid in proxied if pid else False
+                tag = " [green](proxied)[/]" if is_proxied else " [red](bypassing proxy)[/]"
+                console.print(f"  [cyan]Current model:[/] [bold]{current_model}[/]{tag}")
+            proxied = s.get("proxied_providers", [])
+            if proxied:
+                upstreams = s.get("upstreams", {})
+                console.print(f"  [cyan]Proxied providers:[/]")
+                for p in proxied:
+                    ups = upstreams.get(p, "")
+                    console.print(f"    [cyan]{p}[/] -> {ups}")
+            not_proxied = s.get("not_proxied_providers", [])
+            if not_proxied:
+                console.print(f"  [yellow]Env providers NOT proxied:[/]")
+                for p in not_proxied:
+                    console.print(f"    [red]{p}[/] [dim](bypasses proxy — restart to fix)[/]")
+            if s.get("models"):
+                console.print(f"\n  [cyan]Model history:[/]")
+                for model, stats in sorted(s["models"].items(), key=lambda x: -x[1]["tokens"]):
+                    console.print(f"    [bold]{model}[/]  [dim]{stats['requests']} reqs[/]  [green]{stats['tokens']:,} tokens saved[/]")
             console.print(f"\n  1. Start proxy")
             console.print(f"  2. Stop proxy")
-            console.print(f"  3. Back")
+            console.print(f"  3. Restart proxy   4. Back")
             ch = input("  Choice: ").strip()
             if ch == "1": CompressionProxy.start_server()
             elif ch == "2": CompressionProxy.stop_server()
+            elif ch == "3": CompressionProxy.stop_server(); CompressionProxy.start_server()
             press_any()
 
         elif action == 'dashboard':
@@ -5196,7 +5652,7 @@ def interactive_menu():
     console.print("\n  [yellow]Bye! Restart opencode if you changed anything.[/]")
 
 if __name__ == "__main__":
-    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh"}
+    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "frost", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh"}
     first = sys.argv[1] if len(sys.argv) > 1 else ""
     if len(sys.argv) == 1:
         try: interactive_menu()

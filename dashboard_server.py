@@ -283,7 +283,7 @@ class DH(http.server.BaseHTTPRequestHandler):
                 p=json.load(open(proxy_cfg,encoding="utf-8")); rn=False
                 try: urllib.request.urlopen("http://127.0.0.1:"+str(p.get("port",8199)),timeout=2); rn=True
                 except: pass
-                stats["proxy"]={"enabled":p.get("enabled",False),"running":rn,"port":p.get("port",8199),"total_saved_tokens":p.get("total_saved_tokens",0),"requests_served":len(p.get("history",[]))}
+                stats["proxy"]={"enabled":p.get("enabled",False),"running":rn,"port":p.get("port",8199),"total_saved_tokens":p.get("total_saved_tokens",0),"frost_total_saved_tokens":p.get("frost_total_saved_tokens",0),"requests_served":len(p.get("history",[]))}
             except: pass
         # Budget
         budget = PATHS.get("budget","")
