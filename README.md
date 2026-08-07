@@ -280,6 +280,14 @@ http://127.0.0.1:8199/v1
 
 Keep using the normal provider API key. The tool compresses requests before forwarding them upstream. Automatic config writing is OpenCode-specific; generic mode is portable to any client that lets you set an OpenAI-compatible API base URL.
 
+Codex in VS Code uses the OpenAI Responses API. Start the proxy in generic OpenAI mode, then add this to the active Codex `config.toml` (global or trusted-project `.codex/config.toml`) and restart VS Code:
+
+```toml
+openai_base_url = "http://127.0.0.1:8199/v1"
+```
+
+After sending a Codex prompt, run `python token-saver.py proxy status`; the request count and the relevant model entry in **Model history** should increase.
+
 ### Token Budget Planner
 ```bash
 python token-saver.py budget plan "refactor auth module" --limit 8000

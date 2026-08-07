@@ -2859,6 +2859,35 @@ class PH(http.server.BaseHTTPRequestHandler):
                 return result
             def _clean_msg(m):
                 return {k:v for k,v in m.items() if not (v is None or v == [] or (isinstance(v, str) and v == ""))}
+            # Responses API clients (including Codex) use `input` rather than
+            # Chat Completions' `messages`. Keep the Responses shape intact,
+            # but apply safe reductions to message input blocks.
+            def _compress_response_text(text, cap):
+                if not isinstance(text, str): return text
+                out = text
+                if len(out) > 200: out = _json_crush(out)
+                if len(out) > 200: out = _compress_log(out)
+                if len(out) > cap:
+                    lines = out.splitlines(); keep = max(5, int(cap * 0.6) // 40)
+                    if len(lines) > keep * 2:
+                        out = "\n".join(lines[:keep] + [f"# ... {len(lines)-keep*2} lines omitted"] + lines[-keep:])
+                    else: out = out[:cap] + f"\n# ... truncated ({len(out)-cap} chars)"
+                return out
+            if self.path.split("?", 1)[0].endswith("/responses") and not _skip_compress:
+                response_cap = {"free":1500,"cheap":3000,"moderate":800,"expensive":400}.get(cl, 3000)
+                response_input = data.get("input")
+                if isinstance(response_input, str):
+                    data["input"] = _compress_response_text(response_input, response_cap)
+                elif isinstance(response_input, list):
+                    for item in response_input:
+                        if not isinstance(item, dict): continue
+                        content = item.get("content")
+                        if isinstance(content, str):
+                            item["content"] = _compress_response_text(content, response_cap)
+                        elif isinstance(content, list):
+                            for block in content:
+                                if (isinstance(block, dict) and block.get("type") in ("input_text", "output_text", "text") and isinstance(block.get("text"), str)):
+                                    block["text"] = _compress_response_text(block["text"], response_cap)
             # Apply pipeline to each message content
             comp = []
             tool_result_count = 0
@@ -2916,6 +2945,10 @@ class PH(http.server.BaseHTTPRequestHandler):
                 base = UPSTREAM_MAP.get("__base__") or ""
                 if base:
                     upstream = base.rstrip("/") + "/chat/completions"
+            elif path_only.endswith("/responses"):
+                base = UPSTREAM_MAP.get("__base__") or ""
+                if base:
+                    upstream = base.rstrip("/") + "/responses"
             elif path_only.endswith("/messages"):
                 base = UPSTREAM_MAP.get("__base__") or ""
                 if base:
@@ -2933,6 +2966,8 @@ class PH(http.server.BaseHTTPRequestHandler):
                 if _mu and f"127.0.0.1:{_PROXY_PORT}" not in _mu:
                     if path_only.endswith("/chat/completions"):
                         upstream = _mu + "/chat/completions"
+                    elif path_only.endswith("/responses"):
+                        upstream = _mu + "/responses"
                     elif path_only.endswith("/messages"):
                         upstream = _mu + "/messages"
                     elif path_only.endswith("/models"):
@@ -2986,6 +3021,8 @@ class PH(http.server.BaseHTTPRequestHandler):
                     _mu = _PROVIDER_UPSTREAM[_pick]
                     if path_only.endswith("/chat/completions"):
                         upstream = _mu + "/chat/completions"
+                    elif path_only.endswith("/responses"):
+                        upstream = _mu + "/responses"
                     elif path_only.endswith("/messages"):
                         upstream = _mu + "/messages"
                     elif path_only.endswith("/models"):
@@ -3249,6 +3286,8 @@ def setup_upstream(port, cfg):
         UPSTREAM_MAP["__base__"] = upstream
         UPSTREAM_MAP["/v1/chat/completions"] = upstream + "/chat/completions"
         UPSTREAM_MAP["/chat/completions"] = upstream + "/chat/completions"
+        UPSTREAM_MAP["/v1/responses"] = upstream + "/responses"
+        UPSTREAM_MAP["/responses"] = upstream + "/responses"
         UPSTREAM_MAP["/v1/messages"] = upstream + "/messages"
         UPSTREAM_MAP["/messages"] = upstream + "/messages"
         UPSTREAM_MAP["/v1/models"] = upstream + "/models"
@@ -3317,6 +3356,8 @@ if not UPSTREAM_MAP.get("__base__", ""):
             UPSTREAM_MAP["__base__"] = _mu
             UPSTREAM_MAP["/v1/chat/completions"] = _mu + "/chat/completions"
             UPSTREAM_MAP["/chat/completions"] = _mu + "/chat/completions"
+            UPSTREAM_MAP["/v1/responses"] = _mu + "/responses"
+            UPSTREAM_MAP["/responses"] = _mu + "/responses"
             UPSTREAM_MAP["/v1/messages"] = _mu + "/messages"
             UPSTREAM_MAP["/messages"] = _mu + "/messages"
             UPSTREAM_MAP["/v1/models"] = _mu + "/models"
@@ -3819,7 +3860,7 @@ def print_proxy_env(port: int, provider: str):
     console.print(f"  base_url: {proxy_url}")
     console.print(f"  api_base: {proxy_url}")
     console.print("  api_key: keep using your normal provider key")
-    console.print("\n  [dim]Works with clients that support OpenAI-compatible /v1/chat/completions base URLs.[/]")
+    console.print("\n  [dim]Works with clients that support OpenAI-compatible /v1/chat/completions or /v1/responses URLs (including Codex).[/]")
 
 @proxy.command(name="start")
 @click.option("--port", "-p", default=8199, type=int, help="Port")
