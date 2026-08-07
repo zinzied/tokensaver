@@ -624,6 +624,40 @@ def status_panel():
     except: pass
     return Panel("\n".join(lines), title="Current Status", box=box.SIMPLE, border_style="yellow")
 
+def terminal_home_panel():
+    """Render the compact home dashboard used by the interactive CLI."""
+    try:
+        proxy = CompressionProxy.status()
+    except Exception:
+        proxy = {"running": False, "requests_served": 0, "total_saved_tokens": 0}
+    try:
+        entries = SavingsLedger._load()
+        ledger_saved = sum(int(e.get("saved_tokens", 0) or 0) for e in entries)
+    except Exception:
+        ledger_saved = 0
+    try:
+        cache = ContentCache.stats()
+        cache_text = f"{cache.get('cached_files', 0)} files  |  {cache.get('total_savings_pct', 0):.0f}% avg"
+    except Exception:
+        cache_text = "Unavailable"
+    total_saved = ledger_saved + int(proxy.get("total_saved_tokens", 0) or 0)
+    try:
+        frost = CompressionProxy.config().get("frost", {}) or {}
+        frost_on = bool(frost.get("enabled", False) and frost.get("allow_stateless_marker", False))
+    except Exception:
+        frost_on = False
+
+    proxy_state = "[green]● RUNNING[/]" if proxy.get("running") else "[dim]○ STOPPED[/]"
+    metrics = Table.grid(expand=True, padding=(0, 1))
+    metrics.add_column(ratio=1); metrics.add_column(ratio=1); metrics.add_column(ratio=1); metrics.add_column(ratio=1)
+    metrics.add_row(
+        Panel(f"{total_saved:,}\n[dim]total tokens saved[/]", title="Savings", border_style="green", box=box.ROUNDED),
+        Panel(f"{proxy.get('requests_served', 0):,}\n[dim]proxy requests[/]", title="Traffic", border_style="cyan", box=box.ROUNDED),
+        Panel(f"{cache_text}\n[dim]content cache[/]", title="Cache", border_style="magenta", box=box.ROUNDED),
+        Panel(f"{proxy_state}\n[dim]FROST {'ON' if frost_on else 'SAFE/OFF'}[/]", title="Proxy", border_style="yellow", box=box.ROUNDED),
+    )
+    return Panel(metrics, title="[bold cyan]Token Saver Control Center[/]", subtitle="[dim]Choose an action below[/]", border_style="cyan", box=box.ROUNDED)
+
 def menu(title: str, items: list, current_id: str | None = None) -> dict | None:
     import msvcrt
     idx = 0
@@ -4820,8 +4854,8 @@ def interactive_menu():
 
     while True:
         console.clear(); banner()
-        console.print(status_panel())
-        console.print("\n  [yellow]-- Menu --[/]\n")
+        console.print(terminal_home_panel())
+        console.print("\n  [yellow]-- Actions --[/]  [dim]number to select  |  q to quit[/]\n")
         tbl = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         selectable = []
         for label, action in items:
