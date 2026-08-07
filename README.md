@@ -46,13 +46,11 @@ Reduce token waste and spending when using AI coding models. Compare pricing acr
 - Tracks per-request savings in real-time
 - Port: 8199 (configurable)
 
-#### FROST — System Prompt Freeze (NEW)
+#### FROST — System Prompt Freeze (NEW; opt-in safety gate)
 - **The single biggest per-turn waste in every agent session**: the client re-sends the full system prompt (typically 5–15k tokens) on *every single request*.
-- FROST sends the system prompt **once per session**, then swaps an unchanged copy for a ~6-token marker — the model keeps the full text in its own context from earlier turns, so nothing is lost.
-- **50-turn session with a 9k-token system prompt → ~440,000 tokens saved** (~35-40% of total input).
-- **Provably safe**: only replaces when the system text is byte-identical (SHA256) AND fewer than `refresh_after_tokens` (default 50k) non-system tokens have flowed since the last full send AND the conversation hasn't shrunk (no compaction). Any miss → full prompt re-sent.
-- Works through the proxy → compatible with **any** OpenAI/Anthropic-format client (OpenCode, Claude Code, Cursor, VS Code).
-- Runs even on very large conversations where content compression is skipped.
+- FROST is **disabled by default for correctness**. Standard chat-completions APIs are stateless between HTTP requests, so an upstream model cannot recover a prompt replaced by a marker.
+- FROST never rewrites prompts unless both `enabled: true` and the explicit acknowledgement `allow_stateless_marker: true` are present in `proxy.json`. Use that opt-in only with a protocol that demonstrably preserves the earlier prompt outside the request body.
+- When explicitly enabled, it still requires a byte-identical SHA256, an unshrunk conversation, and an unexpired refresh threshold.
 
 #### Content-Addressed Store
 - **SHA256-based content addressing** for reversible compression
@@ -154,7 +152,7 @@ python token-saver.py
 ```bash
 python token-saver.py                              # Interactive menu
 python token-saver.py set cheapest                 # Quick-set model tier
-python token-saver.py save-max                     # One-command full optimization (cheapest models, compaction, fallbacks, proxy, FROST)
+python token-saver.py save-max                     # One-command full optimization (cheapest models, compaction, fallbacks, proxy; FROST stays safe/off)
 python token-saver.py save-max --no-proxy          # Same but skip the proxy
 python token-saver.py save-money --mode free       # Prefer free models and preserve limited free-tier tokens
 python token-saver.py save-money --mode paid --max-paid-cost 5 --apply  # Cap paid model spend and apply
@@ -263,14 +261,15 @@ python token-saver.py proxy env --provider openai
 
 ### FROST — System Prompt Freeze (NEW)
 ```bash
-python token-saver.py frost on                     # Enable FROST in the proxy
-python token-saver.py frost on --refresh-after-tokens 30000   # Smaller safety window
+python token-saver.py frost on                     # Configure FROST but keep rewriting safely disabled
+python token-saver.py frost on --allow-stateless-marker  # Explicitly opt into protocol-specific marker mode
+python token-saver.py frost on --allow-stateless-marker --refresh-after-tokens 30000   # Smaller safety window
 python token-saver.py frost off                    # Disable
 python token-saver.py frost status                 # Status + total tokens saved
 python token-saver.py frost test "<system prompt>" '[{"role":"user","content":"hi"}]'  # Dry-run
 python token-saver.py proxy start --no-frost       # Force FROST off for one proxy run
 ```
-`save-max` enables FROST automatically. The proxy replaces an unchanged system prompt with a small marker after the first request of each session, and re-sends the full prompt whenever the system text changes, the conversation compacts, or the safety window (50k non-system tokens by default) is crossed.
+`save-max` leaves FROST safely disabled. Standard chat-completions APIs are stateless between requests, so marker mode is only available with the explicit `--allow-stateless-marker` acknowledgement and a provider protocol that preserves the earlier system prompt outside the request body.
 
 For VS Code extensions, Hermes, custom scripts, or any OpenAI-compatible CLI, set the client base URL to:
 
@@ -279,6 +278,16 @@ http://127.0.0.1:8199/v1
 ```
 
 Keep using the normal provider API key. The tool compresses requests before forwarding them upstream. Automatic config writing is OpenCode-specific; generic mode is portable to any client that lets you set an OpenAI-compatible API base URL.
+
+### Local Proxy Verification
+
+Run the hermetic integration test to measure the exact request body received by a fake upstream:
+
+```bash
+python proxy_self_test.py
+```
+
+It uses no API key and makes no external requests. It verifies that a compressible request is reduced, that oversized conversations are left unchanged by the safety bypass, and that the FROST safety gate is present in the generated proxy. Provider billing still needs to be checked against that provider's own usage data.
 
 Codex in VS Code uses the OpenAI Responses API. Start the proxy in generic OpenAI mode, then add this to the active Codex `config.toml` (global or trusted-project `.codex/config.toml`) and restart VS Code:
 

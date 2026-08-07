@@ -1086,12 +1086,14 @@ def save_max(no_proxy: bool):
             steps.append(("Proxy", "already running"))
         elif CompressionProxy.start_server():
             steps.append(("Proxy", "started (adaptive — works with any provider)"))
-        # FROST: freeze the system prompt — the biggest per-turn waste in every session.
+        # Keep FROST safe by default. Stateless upstream APIs cannot recover a
+        # prompt replaced by a marker, so save-max must not opt into rewriting.
         pcfg = CompressionProxy.config()
-        pcfg.setdefault("frost", {})["enabled"] = True
+        pcfg.setdefault("frost", {})["enabled"] = False
+        pcfg["frost"]["allow_stateless_marker"] = False
         pcfg["frost"].setdefault("refresh_after_tokens", 50000)
         CompressionProxy.save_config(pcfg)
-        steps.append(("FROST", "system-prompt freeze ON (saves ~5-15k tokens/turn)"))
+        steps.append(("FROST", "safe mode (prompt rewriting OFF)"))
     tbl = Table(box=box.SIMPLE, show_header=False)
     tbl.add_column("Setting", style="cyan"); tbl.add_column("Value", style="green")
     for label, val in steps: tbl.add_row(f"  {label}", val)
@@ -2668,9 +2670,9 @@ def _cost_level(mid):
     if total < 20: return "moderate"
     return "expensive"
 # --- FROST: System Prompt Freeze --------------------------------------
-# The client re-sends the full system prompt on every single request. FROST
-# sends it once per session, then swaps an unchanged copy for a tiny marker —
-# the model keeps the full text in its own context from the earlier turns.
+# The client re-sends the full system prompt on every single request. FROST can
+# swap an unchanged copy for a tiny marker only for a protocol that explicitly
+# preserves the prompt outside the request body; ordinary APIs are stateless.
 # Safety: only replace while (a) the system text is byte-identical (SHA256) to
 # what we sent last for this session, (b) fewer than refresh_after_tokens of
 # non-system tokens have flowed since the last full send (so the full prompt is
@@ -2738,7 +2740,11 @@ def _frost_apply(data, model_id, path_only):
         return 0
     sys_hash = hashlib.sha256(sys_text.encode("utf-8")).hexdigest()
     fcfg = _frost_cfg()
-    if not fcfg.get("enabled", False):
+    # Standard chat-completions APIs are stateless between HTTP requests: an
+    # upstream model cannot recover a prompt that was replaced by a marker.
+    # ``enabled`` alone is intentionally insufficient for backwards safety;
+    # the user must explicitly acknowledge this protocol-specific behaviour.
+    if not fcfg.get("enabled", False) or not fcfg.get("allow_stateless_marker", False):
         return 0
     threshold = int(fcfg.get("refresh_after_tokens", _FROST_DEFAULT_THRESHOLD))
     non_sys = sum(len(json.dumps(m.get("content", ""), ensure_ascii=False)) // 4
@@ -3930,17 +3936,21 @@ def proxy_status():
 
 @cli.group()
 def frost():
-    """FROST — freeze the system prompt (dedupe repeats across turns)"""
+    """FROST — optional protocol-specific system-prompt marker mode"""
     pass
 
 @frost.command(name="on")
 @click.option("--refresh-after-tokens", default=50000, type=int, help="Re-send full system prompt after this many non-system tokens (safety window)")
-def frost_on(refresh_after_tokens: int):
-    """Enable FROST in the compression proxy"""
+@click.option("--allow-stateless-marker", is_flag=True, help="Acknowledge that the upstream preserves prompts outside the request body")
+def frost_on(refresh_after_tokens: int, allow_stateless_marker: bool):
+    """Enable FROST only for a provider with documented prompt persistence"""
     cfg = CompressionProxy.config()
-    cfg["frost"] = {"enabled": True, "refresh_after_tokens": refresh_after_tokens}
+    cfg["frost"] = {"enabled": allow_stateless_marker, "allow_stateless_marker": allow_stateless_marker, "refresh_after_tokens": refresh_after_tokens}
     CompressionProxy.save_config(cfg)
-    console.print("\n  [green][OK] FROST enabled.[/]")
+    if allow_stateless_marker:
+        console.print("\n  [yellow][WARN] FROST marker mode enabled; verify your provider preserves the earlier system prompt.[/]")
+    else:
+        console.print("\n  [green][OK] FROST remains safely disabled.[/] Use --allow-stateless-marker only for a compatible protocol.")
     console.print("  [dim]Restart the proxy (`proxy stop` + `proxy start`) if it is already running.[/]")
     console.print(f"  [dim]Safety window: re-sends the full system prompt every {refresh_after_tokens:,} non-system tokens.[/]")
 
@@ -3958,7 +3968,7 @@ def frost_status():
     """Show FROST status and tokens saved"""
     cfg = CompressionProxy.config()
     f = cfg.get("frost", {}) or {}
-    enabled = f.get("enabled", False)
+    enabled = f.get("enabled", False) and f.get("allow_stateless_marker", False)
     threshold = f.get("refresh_after_tokens", 50000)
     total = cfg.get("frost_total_saved_tokens", 0)
     console.print(f"\n  [cyan]FROST (System Prompt Freeze):[/] {'[green]ON[/]' if enabled else '[red]OFF[/]'}")
@@ -3970,7 +3980,7 @@ def frost_status():
 @click.argument("system_prompt")
 @click.argument("messages_json")
 def frost_test(system_prompt: str, messages_json: str):
-    """Dry-run: show a first request (full system) then an identical one (marker)"""
+    """Illustrate the marker transformation (not safe for ordinary stateless APIs)"""
     try:
         msgs = json.loads(messages_json)
         if not isinstance(msgs, list):
@@ -5101,7 +5111,7 @@ def interactive_menu():
             console.clear(); banner()
             cfg = CompressionProxy.config()
             f = cfg.get("frost", {}) or {}
-            enabled = f.get("enabled", False)
+            enabled = f.get("enabled", False) and f.get("allow_stateless_marker", False)
             threshold = f.get("refresh_after_tokens", 50000)
             total = cfg.get("frost_total_saved_tokens", 0)
             console.print(f"\n  [cyan]FROST (System Prompt Freeze):[/] {'[green]ON[/]' if enabled else '[red]OFF[/]'}")
@@ -5112,9 +5122,9 @@ def interactive_menu():
             console.print(f"  [yellow]Enter.[/] Back")
             choice = input("\n  Select: ").strip()
             if choice == "1":
-                cfg["frost"] = {"enabled": True, "refresh_after_tokens": threshold}
+                cfg["frost"] = {"enabled": False, "allow_stateless_marker": False, "refresh_after_tokens": threshold}
                 CompressionProxy.save_config(cfg)
-                console.print("  [green][OK] FROST enabled.[/]  [dim]Restart proxy to apply if running.[/]")
+                console.print("  [green][OK] FROST remains safely disabled.[/]  [dim]Use `frost on --allow-stateless-marker` only for a compatible protocol.[/]")
             elif choice == "2":
                 cfg.setdefault("frost", {})["enabled"] = False
                 CompressionProxy.save_config(cfg)
@@ -5708,6 +5718,3 @@ if __name__ == "__main__":
     try: cli()
     except KeyboardInterrupt:
         console.clear(); banner(); console.print("\n  [yellow]Bye![/]")
-
-
-
