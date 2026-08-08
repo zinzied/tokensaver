@@ -624,6 +624,8 @@ def status_panel():
     except: pass
     return Panel("\n".join(lines), title="Current Status", box=box.SIMPLE, border_style="yellow")
 
+HOME_REFRESH_S = float(os.environ.get("TOKEN_SAVER_HOME_REFRESH", "2.0"))
+
 def terminal_home_panel():
     """Render the compact home dashboard used by the interactive CLI."""
     try:
@@ -4869,16 +4871,35 @@ def interactive_menu():
         console.print(f"\n  [dim]Enter number (1-{len(selectable)}) or 'q' to quit: [/]", end="")
         import msvcrt
         choice = b''
+        with console.capture() as cap:
+            console.print(terminal_home_panel())
+        last_sig = cap.get(); last_tick = time.monotonic()
         while True:
-            k = msvcrt.getch()
-            if k in (b'q', b'Q', b'\x1b'): choice = b'q'; break
-            if k in (b'\r', b'\n') and choice: break
-            if k == b'\x08' or k == b'\x7f':
-                if choice:
-                    choice = choice[:-1]
-                    print('\b \b', end='', flush=True)
-                continue
-            if k.isdigit(): choice += k; print(k.decode(), end='', flush=True)
+            if msvcrt.kbhit():
+                k = msvcrt.getch()
+                if k in (b'q', b'Q', b'\x1b'): choice = b'q'; break
+                if k in (b'\r', b'\n') and choice: break
+                if k == b'\x08' or k == b'\x7f':
+                    if choice:
+                        choice = choice[:-1]
+                        print('\b \b', end='', flush=True)
+                    continue
+                if k.isdigit(): choice += k; print(k.decode(), end='', flush=True)
+            elif time.monotonic() - last_tick >= HOME_REFRESH_S:
+                last_tick = time.monotonic()
+                with console.capture() as cap2:
+                    console.print(terminal_home_panel())
+                sig = cap2.get()
+                if sig != last_sig:
+                    last_sig = sig
+                    console.clear(); banner()
+                    console.print(terminal_home_panel())
+                    console.print("\n  [yellow]-- Actions --[/]  [dim]number to select  |  q to quit[/]\n")
+                    console.print(tbl)
+                    console.print(f"\n  [dim]Enter number (1-{len(selectable)}) or 'q' to quit: [/]", end="")
+                    if choice: print(choice.decode(), end='', flush=True)
+            else:
+                time.sleep(0.05)
         print(); console.print("")
         if choice == b'q': break
         try: idx = int(choice) - 1
