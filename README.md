@@ -184,6 +184,85 @@ python token-saver.py skill install cursor           # Install skill for Cursor
 python token-saver.py skill status                   # Check installation status
 ```
 
+### Chef Agent Proxy (Orchestre-chef Agents — paid → free routing)
+A zero-dependency chef orchestrator that makes your paid-model CLI agents **use free models instead**. The proxy is both OpenAI-compatible (`/v1/chat/completions`) and Anthropic-compatible (`/v1/messages`). Point any CLI IDE at it and paid model calls (`gpt-5`, `claude-*`, `o1`, ...) are rerouted to free models with automatic cross-provider fallback — **and every forwarded request is token-compressed** (json crush, log dedup, size caps) so you save twice: cheaper model + fewer tokens.
+
+#### Difficulty-aware routing (money-first)
+Instead of blindly sending everything to free models, the chef orchestrator **scores each task's difficulty** and routes it onto a **3-tier labor ladder** (Fable-orchestrator inspired):
+
+```
+TIER      effort    runs on                                    work
+────────  ────────  ─────────────────────────────────────────  ─────────────────────────────
+bulk      low       free chat (deepseek-chat :free)            mechanical volume: grep, format,
+                                                               rename, read, simple edits
+worker    high      free code (qwen-coder :free)               implementation, tests, debugging,
+                                                               refactors, routine judgment
+expert    max       strong paid (paid/gpt-5, budget-capped)    architecture, migrations, security,
+                                                               complex multi-system work
+```
+
+- **EASY** tasks → `bulk` tier, free, effort `low`
+- **MEDIUM** tasks → `worker` tier, free, effort `high`
+- **HARD** tasks → `expert` tier, **strong paid model** (budget-capped), effort `max`, falling back to free reasoning
+
+This saves money and tokens on routine work **without ever losing quality on the hard stuff** — hard tasks keep a frontier model.
+
+**Free-only fallback for hard tasks:** if no paid model is within budget (or you set `CHEF_FREE_ONLY=1`), hard tasks still get a strong model — the best free reasoning model across whichever providers you actually have (OpenRouter `:free`, Groq, Gemini, or local Ollama). A user with only `GROQ_API_KEY` still gets `groq/llama-70b` on hard tasks instead of an error.
+
+```bash
+python token-saver.py chef route "fix the login bug in auth.py"   # tier WORKER, free
+python token-saver.py chef route "redesign the distributed architecture"  # tier EXPERT, paid
+python token-saver.py chef route "hard task" --max-paid 0.2       # cap paid spend ($/M input)
+python token-saver.py chef route "hard task"                       # with only GROQ/GEMINI/Ollama: best free model
+python token-saver.py chef proxy --port 8787                      # proxy scores every request live
+python token-saver.py chef plan "build a flask todo app" --write  # TODO plan: tier/effort/model per step
+python token-saver.py chef ask "what is the capital of France?"    # auto: easy -> free
+python token-saver.py chef ask "complex task" --escalate          # retry one tier up if answer is uncertain
+python token-saver.py chef ask "task" --effort high               # send reasoning_effort upstream
+python token-saver.py chef models                                  # free + paid catalog, key status
+```
+
+**Fresh-eyes verification** (Fable's "verify every close") — a *separate* cheap model that did NOT build the work checks it against the task before you call it done:
+
+```bash
+python token-saver.py chef verify "add a login form with CSRF" --file app.py
+python token-saver.py chef verify "refactor auth to OAuth" --work "oauth module done, jwt added"
+# -> VERDICT: PASS / FAIL + FINDINGS
+```
+
+**Escalation lane** — a worker that is "uncertain" climbs one tier up automatically (`ask --escalate`): bulk → worker → expert. The expert tier is the ceiling.
+
+The proxy applies the same scoring to every intercepted request (it inspects the latest user message), so hard requests keep a strong model while easy turns cost ~nothing.
+
+**Tuning env vars:**
+- `CHEF_DIFFICULTY_THRESHOLD` (default `65`) — minimum score that upgrades a task to the expert/paid tier
+- `CHEF_MAX_PAID_USD_PER_M` (default `20`) — max input $/M tokens for the paid model; lower it to only ever use cheap paid models
+- `CHEF_FREE_ONLY` (default off) — `1`/`true`/`yes`/`on` forces zero paid spend: hard tasks route to the best free reasoning model you have, even with a key + budget set
+- `CHEF_COMPRESS` (default on) — `0` disables the built-in request compression; the chef proxy then forwards uncompressed (pure routing)
+- `CHEF_COMPRESS_MIN_TOKENS` (default `200`) — skip compression for requests under this many estimated tokens; a tiny prompt costs nothing to compress but can't save anything either
+- `CHEF_FROST` — FROST (system prompt freeze) is built into the chef proxy too; enable it once via `frost on --allow-stateless-marker` and the proxy freezes unchanged system prompts on top of routing + compression
+
+**Savings ledger, audit log and stats** — every forwarded request is persisted to a JSONL ledger (`~/.config/opencode/compress/chef-ledger.jsonl`): requested model, model routed to, chars before/after, FROST tokens, and an **estimated USD saved** (input tokens avoided × the requested model's $/M rate). The live proxies expose:
+- `GET /health` — live counters plus today's ledger totals (`ledger.today`)
+- `GET /log` — last 100 requests in memory (audit trail)
+- `GET /stats` — today + 7-day series as JSON
+- `GET /chart` — self-contained HTML 7-day savings chart
+- `chef proxy-status` / menu option 7 — today's totals, USD saved and a console 7-day bar chart
+- `chef proxy-log [-n N]` — recent audit entries (falls back to the persisted ledger after a restart)
+
+Set at least one key: `OPENROUTER_API_KEY` (recommended, many `:free` models **and** the paid chain), `GROQ_API_KEY`, `GEMINI_API_KEY`, or run local Ollama (`OLLAMA_HOST`). Route examples: `gpt-5`/`claude-*` → a free model (currently `openai/gpt-oss-20b:free`) on easy tasks, `paid/gpt-5` (OpenRouter) on hard tasks.
+
+```powershell
+# Claude Code
+$env:ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+$env:ANTHROPIC_API_KEY="chef"
+$env:ANTHROPIC_MODEL="claude-3-5-sonnet"
+
+# OpenAI Codex CLI
+$env:OPENAI_BASE_URL="http://127.0.0.1:8787/v1"
+$env:OPENAI_API_KEY="chef"
+```
+
 ### Self-Upgrade (New)
 ```bash
 python token-saver.py upgrade --check    # Check for updates
@@ -269,7 +348,7 @@ python token-saver.py frost status                 # Status + total tokens saved
 python token-saver.py frost test "<system prompt>" '[{"role":"user","content":"hi"}]'  # Dry-run
 python token-saver.py proxy start --no-frost       # Force FROST off for one proxy run
 ```
-`save-max` leaves FROST safely disabled. Standard chat-completions APIs are stateless between requests, so marker mode is only available with the explicit `--allow-stateless-marker` acknowledgement and a provider protocol that preserves the earlier system prompt outside the request body.
+`save-max` leaves FROST safely disabled. Standard chat-completions APIs are stateless between requests, so marker mode is only available with the explicit `--allow-stateless-marker` acknowledgement and a provider protocol that preserves the earlier system prompt outside the request body. FROST config applies to **both** the compression proxy and the Chef proxy (route+compress) — the Chef proxy freezes an unchanged system prompt before routing, so you save tokens on every repeated prompt regardless of which proxy handles the request.
 
 For VS Code extensions, Hermes, custom scripts, or any OpenAI-compatible CLI, set the client base URL to:
 

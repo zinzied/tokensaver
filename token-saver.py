@@ -54,6 +54,25 @@ except ImportError:
     _AUTH_AVAILABLE = False
 
 try:
+    from chef.proxy import serve as chef_serve
+    from chef.ask import ask as chef_ask
+    from chef.plan import plan as chef_plan
+    from chef.verify import verify as chef_verify
+    from chef.catalog import MODELS as CHEF_MODELS
+    from chef.catalog import PAID_MODELS as CHEF_PAID_MODELS
+    from chef.catalog import TIER_NAMES as CHEF_TIER_NAMES
+    from chef.catalog import recommend as chef_recommend, escalate as chef_escalate
+    from chef.difficulty import is_uncertain as chef_is_uncertain
+    from chef.config import HOST as CHEF_HOST, PORT as CHEF_PORT, MAX_PAID_PER_M as CHEF_MAX_PAID_PER_M
+    from chef.config import FREE_ONLY as CHEF_FREE_ONLY
+    from chef.upstream import provider_available as chef_provider_available
+    from chef.upstream import UpstreamError as ChefUpstreamError, ConfigError as ChefConfigError
+    import chef.ledger as _chef_ledger
+    _CHEF_AVAILABLE = True
+except ImportError:
+    _CHEF_AVAILABLE = False
+
+try:
     if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -1047,7 +1066,8 @@ def cli():
     """Token Saver - Compare providers & models, compress context, save tokens.
     Commands: set, save-max, save-money, compare, free, providers, verify,
     restore, health, recommend, heatmap, compress, cache, proxy, budget,
-    savings, store, fallback, dashboard, search, sql, stats, mcp, skill, upgrade
+    savings, store, fallback, dashboard, search, sql, stats, mcp, skill, upgrade,
+    chef (paid->free routing proxy)
     """
     pass
 
@@ -3581,6 +3601,122 @@ Server(("127.0.0.1",''' + str(port) + r'''),PH).serve_forever()
             "not_proxied_providers": not_proxied,
         }
 
+
+def chef_chart_lines(week):
+    """Render a 7-day USD-savings bar chart as console lines."""
+    max_usd = max([w["usd_saved"] for w in week] + [0.001])
+    lines = []
+    for w in week:
+        bar_w = int(round(w["usd_saved"] / max_usd * 24)) if max_usd else 0
+        bar = "#" * max(1, bar_w) if w["usd_saved"] > 0 else "-"
+        lines.append("  %s |%-24s| $%.4f  (%d req, %d tok)" % (
+            w["date"][5:], bar, w["usd_saved"], w["requests"], w["tokens_saved"]))
+    return lines
+
+
+class ChefProxyManager:
+    """Background lifecycle for the Chef proxy (route + compress + FROST).
+
+    Mirrors CompressionProxy: spawns a detached subprocess, tracks the pid in
+    proxy.json under the "chef" key, and lets the menu start/status/stop it
+    without blocking navigation.
+    """
+    PORT = 8787
+    @staticmethod
+    def config() -> dict:
+        return (CompressionProxy.config().get("chef") or {}) or {}
+
+    @staticmethod
+    def start_server(port: int = None, host: str = "127.0.0.1") -> bool:
+        import time as _t
+        port = port or int(os.environ.get("CHEF_PORT", ChefProxyManager.PORT))
+        if ChefProxyManager.status().get("running"):
+            console.print(f"  [yellow]Chef proxy is already running on http://{host}:{port}.[/]")
+            return False
+        import socket as _sk
+        try:
+            s = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+            s.bind((host, port)); s.close()
+        except OSError:
+            console.print(f"  [red]Port {port} is in use. Stop whatever uses it or set CHEF_PORT.[/]")
+            return False
+        repo = Path(__file__).resolve().parent
+        script_path = COMPRESS_DIR / "_chef_proxy.py"
+        script_path.write_text(
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from chef.proxy import serve\n"
+            "serve(%r, %d)\n" % (str(repo), host, port),
+            encoding="utf-8")
+        err_log = COMPRESS_DIR / "chef_proxy_stderr.log"
+        err_fh = open(err_log, "ab")
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            )
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=err_fh,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+            close_fds=True,
+        )
+        try:
+            err_fh.close()
+        except Exception:
+            pass
+        _t.sleep(0.6)
+        alive = True
+        try:
+            if proc.poll() is not None:
+                alive = False
+        except Exception:
+            pass
+        if not alive:
+            console.print("  [red][ERR] Chef proxy exited immediately. See chef_proxy_stderr.log[/]")
+            return False
+        cfg = CompressionProxy.config()
+        cfg["chef"] = {"pid": proc.pid, "port": port, "host": host}
+        CompressionProxy.save_config(cfg)
+        console.print(f"  [green][OK] Chef proxy started in background on http://{host}:{port}[/]")
+        console.print("  [dim]Keep using the menu; stop it later via Chef menu -> Stop Chef Proxy.[/]")
+        return True
+
+    @staticmethod
+    def stop_server() -> bool:
+        cfg = ChefProxyManager.config()
+        if cfg.get("pid"):
+            try:
+                subprocess.run(["taskkill", "/PID", str(cfg["pid"]), "/F"], capture_output=True)
+            except Exception:
+                pass
+        meta = CompressionProxy.config()
+        meta.pop("chef", None)
+        CompressionProxy.save_config(meta)
+        console.print("  [green][OK] Chef proxy stopped.[/]")
+        return True
+
+    @staticmethod
+    def status() -> dict:
+        import urllib.request as _ur
+        cfg = ChefProxyManager.config()
+        port = cfg.get("port", int(os.environ.get("CHEF_PORT", ChefProxyManager.PORT)))
+        host = cfg.get("host", "127.0.0.1")
+        running = False
+        health = {}
+        if cfg.get("pid"):
+            try:
+                with _ur.urlopen(f"http://{host}:{port}/health", timeout=2) as r:
+                    health = json.loads(r.read().decode("utf-8", "replace"))
+                running = health.get("status") == "ok"
+            except Exception:
+                running = False
+        return {"running": running, "port": port, "pid": cfg.get("pid"), "health": health}
+
 class DashboardServer:
     PORT = 8200
 
@@ -4224,6 +4360,240 @@ def dashboard_status():
         console.print(f"  [cyan]URL:[/] http://127.0.0.1:{s.get('port', 8200)}")
 
 # ============================================================================
+# CHEF AGENT PROXY (Orchestre-chef Agents) - route paid model calls to free models
+# ============================================================================
+
+@cli.group()
+def chef():
+    """Chef Agent Proxy - route paid model calls from CLI IDEs to free models"""
+    if not _CHEF_AVAILABLE:
+        console.print("  [red]Chef module not available. Ensure the 'chef' package is present next to token-saver.py.[/]")
+        raise click.exceptions.Exit(1)
+
+@chef.command(name="proxy")
+@click.option("--host", default=CHEF_HOST, help="Bind host")
+@click.option("--port", "-p", type=int, default=CHEF_PORT, help="Proxy port")
+@click.option("--no-compress", is_flag=True, help="Disable request compression (pure routing only)")
+@click.option("--background", "-b", is_flag=True, help="Run detached in the background (stop via `chef proxy stop`)")
+def chef_proxy(host: str, port: int, no_compress: bool, background: bool):
+    """Run the HTTP proxy (OpenAI + Anthropic compatible). Paid model calls are rerouted to free models; every request is token-compressed."""
+    if no_compress:
+        import chef.config as _chef_cfg
+        _chef_cfg.COMPRESS = False
+    if background:
+        ChefProxyManager.start_server(port, host)
+        return
+    console.clear(); banner()
+    console.print("  [yellow]Chef Agent Proxy[/]  [dim]combined: difficulty routing + compression + FROST[/]")
+    console.print(f"  [cyan]OpenAI-compatible:[/]   http://{host}:{port}/v1/chat/completions")
+    console.print(f"  [cyan]Anthropic-compatible:[/] http://{host}:{port}/v1/messages")
+    console.print(f"  [cyan]Compression:[/] {'OFF (--no-compress)' if no_compress else 'ON'}")
+    console.print("  [dim]Set your CLI IDE base URL to this proxy to route paid -> free.\n[/]")
+    try:
+        chef_serve(host, port)
+    except KeyboardInterrupt:
+        console.print("\n  [yellow]Chef proxy stopped.[/]")
+
+@chef.command(name="proxy-stop")
+def chef_proxy_stop():
+    """Stop the background Chef proxy"""
+    ChefProxyManager.stop_server()
+
+@chef.command(name="proxy-status")
+def chef_proxy_status():
+    """Show background Chef proxy status + live savings counters"""
+    st = ChefProxyManager.status()
+    if not st["running"]:
+        console.print("  [red]Chef proxy is not running.[/]")
+        return
+    h = st["health"]
+    console.print(f"\n  [cyan]Chef Proxy Status[/]  [dim]http://{CHEF_HOST}:{st['port']}[/]  [dim](pid {st['pid']})[/]")
+    console.print(f"  [cyan]Status:[/] [green]running[/]")
+    console.print(f"  [cyan]Compression:[/] {'[green]ON[/]' if h.get('compress') else '[red]OFF[/]'}"
+                  f"  [dim](skips requests < {h.get('min_compress_tokens', 200)} tokens)[/]")
+    console.print(f"  [cyan]Chars compressed:[/] [green]{h.get('saved_chars', 0):,}[/]  [dim](~{h.get('saved_chars', 0) // 4:,} tokens)[/]")
+    console.print(f"  [cyan]FROST tokens saved:[/] [green]{h.get('frost_saved_tokens', 0):,}[/]")
+    lt = (h.get("ledger") or {}).get("today") or {}
+    if lt.get("requests"):
+        console.print(f"  [cyan]Today:[/] [green]{lt.get('requests', 0)}[/] requests | "
+                      f"[green]{lt.get('tokens_saved', 0):,}[/] tokens saved | "
+                      f"[bold green]${lt.get('usd_saved', 0.0):.4f}[/] estimated saved")
+    try:
+        week = _chef_ledger.week_series(7)
+    except Exception:
+        week = []
+    if week and any(w["requests"] for w in week):
+        console.print("\n  [cyan]Last 7 days (estimated USD saved):[/]")
+        for line in chef_chart_lines(week):
+            console.print(line)
+    console.print("  [dim]Chart page: http://127.0.0.1:{}/chart   Audit log: chef proxy-log[/]".format(st["port"]))
+
+@chef.command(name="proxy-log")
+@click.option("-n", "--num", default=20, help="how many recent entries to show (max 100)")
+def chef_proxy_log(num: int):
+    """Show the recent request audit log from the running Chef proxy"""
+    st = ChefProxyManager.status()
+    if not st["running"]:
+        console.print("  [red]Chef proxy is not running.[/]")
+        return
+    import urllib.request as _ur
+    url = f"http://{CHEF_HOST}:{st['port']}/log?n={max(1, min(num, 100))}"
+    entries = []
+    total = 0
+    try:
+        with _ur.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        entries = data.get("entries", [])
+        total = data.get("count", len(entries))
+    except Exception:
+        pass
+    if not entries:
+        entries = _chef_ledger.recent(max(1, min(num, 100)))
+        total = len(entries)
+    if not entries:
+        console.print("  [dim]No requests logged yet.[/]")
+        return
+    console.print(f"\n  [cyan]Chef Proxy Audit Log[/]  [dim]({total} total, showing last {len(entries)})[/]\n")
+    for e in reversed(entries):
+        usd = f"  $[bold green]{e.get('usd_saved', 0.0):.4f}[/]" if e.get("usd_saved") else ""
+        frost = f" [cyan]FROST +{e.get('frost_saved_tokens', 0)}[/]" if e.get("frost_saved_tokens") else ""
+        console.print("  %s %-9s %s -> %s  [dim]%s chars -> %s (saved %d tok)[/]%s%s" % (
+            e.get("ts", ""), e.get("kind", ""), e.get("model_requested", ""),
+            e.get("model_routed", ""), e.get("chars_before", 0), e.get("chars_after", 0),
+            e.get("tokens_saved", 0), frost, usd))
+        if e.get("text"):
+            console.print("      [dim]%s[/]" % e["text"][:80])
+
+@chef.command(name="plan")
+@click.argument("task", nargs=-1)
+@click.option("-m", "--model", default="", help="force a chef/ or paid/ model id (default: auto by difficulty)")
+@click.option("--write", is_flag=True, help="Also write TODO.md")
+def chef_plan_cmd(task: tuple[str], model: str, write: bool):
+    """Generate a TODO plan with tier/effort/model per step (by difficulty)"""
+    text = " ".join(task).strip() or "Build a small web app"
+    console.print("  [yellow]Planning with free model (auto-picked by difficulty)...[/]")
+    try:
+        result = chef_plan(text, model=model)
+    except (ChefUpstreamError, ChefConfigError) as exc:
+        console.print(f"  [red]error: {exc}[/]")
+        return
+    console.print(result)
+    if write:
+        with open("TODO.md", "w", encoding="utf-8") as fh:
+            fh.write("# TODO\n\n" + result + "\n")
+        console.print("\n  [green]Wrote TODO.md[/]")
+
+@chef.command(name="ask")
+@click.argument("prompt", nargs=-1)
+@click.option("-m", "--model", default="", help="force a chef/ or paid/ model id (default: auto by difficulty)")
+@click.option("--escalate", is_flag=True, help="if the response signals uncertainty, retry one tier up")
+@click.option("--effort", type=click.Choice(["low", "medium", "high"]), default=None, help="reasoning_effort to send upstream")
+def chef_ask_cmd(prompt: tuple[str], model: str, escalate: bool, effort: str):
+    """Ask a model a question (auto: easy->free, hard->paid)"""
+    text = " ".join(prompt).strip() or "Say hello"
+    try:
+        result = chef_ask(text, model=model, reasoning_effort=effort)
+        if escalate and chef_is_uncertain(result):
+            higher = chef_escalate(text, model)
+            if higher:
+                console.print(f"  [dim](worker uncertain -> escalating to {higher})[/]")
+                result = chef_ask(text, model=higher, reasoning_effort=effort)
+    except (ChefUpstreamError, ChefConfigError) as exc:
+        console.print(f"  [red]error: {exc}[/]")
+        return
+    console.print(result)
+
+@chef.command(name="verify")
+@click.argument("task", nargs=-1)
+@click.option("--work", default="", help="The completed work to check (or use --file)")
+@click.option("--file", "file_path", type=click.Path(exists=True), default=None, help="Read completed work from a file")
+@click.option("-m", "--model", default="chef/qwen-coder", help="Verifier model (default: free worker tier)")
+@click.option("--effort", type=click.Choice(["low", "medium", "high"]), default=None, help="reasoning_effort to send upstream")
+def chef_verify_cmd(task: tuple[str], work: str, file_path: str, model: str, effort: str):
+    """Fresh-eyes verification: a separate cheap model checks completed work against the task"""
+    text = " ".join(task).strip()
+    if file_path:
+        work = Path(file_path).read_text(encoding="utf-8", errors="replace")
+    if not text:
+        console.print("  [red]error: provide a task description[/]")
+        return
+    if not work:
+        console.print("  [red]error: provide the completed work via --work or --file[/]")
+        return
+    console.print(f"  [yellow]Fresh-eyes verification with {model} (a model that did NOT build this)...[/]")
+    try:
+        result = chef_verify(text, work, model=model, reasoning_effort=effort)
+    except (ChefUpstreamError, ChefConfigError) as exc:
+        console.print(f"  [red]error: {exc}[/]")
+        return
+    if result["verdict"] == "PASS":
+        console.print("  [bold green]VERDICT: PASS[/]")
+    elif result["verdict"] == "FAIL":
+        console.print("  [bold red]VERDICT: FAIL[/]  [dim]-> fix findings and re-verify[/]")
+    else:
+        console.print("  [yellow]VERDICT: UNKNOWN[/]  [dim](verifier did not emit a clear verdict)[/]")
+    console.print("\n" + result["findings"])
+
+@chef.command(name="models")
+def chef_models():
+    """List available free models and provider key status"""
+    tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+    tbl.add_column("Model", style="cyan")
+    tbl.add_column("Provider", style="white")
+    tbl.add_column("Score", style="yellow")
+    tbl.add_column("Tags", style="white")
+    tbl.add_column("Key set", style="green")
+    for m in sorted(CHEF_MODELS, key=lambda x: -x["score"]):
+        avail = "yes" if chef_provider_available(m["provider"]) else "no"
+        tbl.add_row(m["id"], m["provider"], str(m["score"]), ",".join(m["tags"]), avail)
+    console.print(f"\n  [yellow]Chef Free Model Catalog ({len(CHEF_MODELS)})[/]\n")
+    console.print(tbl)
+    tbl2 = Table(box=box.SIMPLE, show_header=True, header_style="bold magenta")
+    tbl2.add_column("Paid Model (HARD tasks)", style="cyan")
+    tbl2.add_column("Provider", style="white")
+    tbl2.add_column("Label", style="white")
+    tbl2.add_column("$/M in", style="yellow")
+    for m in sorted(CHEF_PAID_MODELS, key=lambda x: -x["score"]):
+        tbl2.add_row(m["id"], m["provider"], m["label"], f"{m['usd_per_m_input']:.2f}")
+    console.print(f"\n  [yellow]Chef Paid Models (used only for HARD tasks, budget-capped @ ${CHEF_MAX_PAID_PER_M:.2f}/M)[/]\n")
+    console.print(tbl2)
+    console.print("  [dim]Set OPENROUTER_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, or run Ollama to enable providers.[/]")
+    console.print("  [dim]Difficulty routing: HARD -> paid, EASY/MEDIUM -> free. Tunable via CHEF_DIFFICULTY_THRESHOLD / CHEF_MAX_PAID_USD_PER_M.[/]")
+
+@chef.command(name="route")
+@click.argument("task", nargs=-1)
+@click.option("--max-paid", type=float, default=None, help="Max $/M input for paid models (default: CHEF_MAX_PAID_USD_PER_M)")
+def chef_route_cmd(task: tuple[str], max_paid: float):
+    """Classify a task's difficulty and recommend a model + tier (easy->free, hard->paid)"""
+    text = " ".join(task).strip() or "Build a small web app"
+    rec = chef_recommend(text, max_paid)
+    color = {"EASY": "green", "MEDIUM": "yellow", "HARD": "red"}[rec["label"]]
+    mode = "  [dim]FREE-ONLY mode[/]" if CHEF_FREE_ONLY else ""
+    console.print(f"\n  [cyan]Task:[/] {text[:120]}")
+    console.print(f"  [cyan]Difficulty:[/] [bold {color}]{rec['label']}[/]  [dim](score {rec['score']}/100)[/]{mode}")
+    console.print(f"  [cyan]Tier:[/] [bold]{rec['tier'].upper()}[/]  [dim]{CHEF_TIER_NAMES[rec['tier']]}  |  effort={rec['effort'].upper()}[/]")
+    cost = "[magenta]PAID[/]" if rec["cost"] == "paid" else "[green]FREE[/]"
+    price = f"  [dim]~${rec['price']:.2f}/M in[/]" if rec["cost"] == "paid" else ""
+    console.print(f"  [cyan]Recommended:[/] [bold]{rec['model_id']}[/] {cost} {rec['model_label']}{price}")
+    if rec["cost"] == "free" and rec["tier"] == "expert":
+        console.print("  [dim](free-only / no paid within budget -> best free model you have serves the hard task)[/]")
+    higher = chef_escalate(text, rec["model_id"], max_paid)
+    esc = higher or "at ceiling (no higher tier)"
+    console.print(f"  [cyan]Escalation:[/] {esc}")
+    tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+    tbl.add_column("#", style="dim")
+    tbl.add_column("Provider/Route", style="white")
+    tbl.add_column("Key set", style="green")
+    for i, (prov, route) in enumerate(rec["chain"][:6], 1):
+        avail = "yes" if chef_provider_available(prov) else "no"
+        tbl.add_row(str(i), f"{prov}/{route}", avail)
+    console.print(f"\n  [yellow]Fallback chain (first {min(6, len(rec['chain']))} of {len(rec['chain'])})[/]\n")
+    console.print(tbl)
+    if len(rec["chain"]) > 6:
+        console.print(f"  [dim]... {len(rec['chain']) - 6} more fallbacks (auto)[/]")
+    console.print("  [dim]Set OPENROUTER_API_KEY to enable paid + free routing. CHEF_FREE_ONLY=1 forces free-only.[/]")
+
+# ============================================================================
 # NEW COMMANDS: search, sql, stats, mcp, skill, upgrade (ctxrs/ctx inspired)
 # ============================================================================
 
@@ -4832,6 +5202,7 @@ def interactive_menu():
         ("Stop Proxy",                                      'proxy_stop'),
         ("Proxy Status",                                    'proxy_stat'),
         ("FROST System Prompt Freeze",                      'frost_status'),
+        ("Chef Agent Proxy (route+compress+FROST)",          'chef_menu'),
         ("",                                                'sep'),
         ("-- [cyan]ADVANCED TOOLS[/] --",                  'header'),
         ("RTK Tool-Result Compression",                     'rtk_test'),
@@ -5169,21 +5540,145 @@ def interactive_menu():
             enabled = f.get("enabled", False) and f.get("allow_stateless_marker", False)
             threshold = f.get("refresh_after_tokens", 50000)
             total = cfg.get("frost_total_saved_tokens", 0)
-            console.print(f"\n  [cyan]FROST (System Prompt Freeze):[/] {'[green]ON[/]' if enabled else '[red]OFF[/]'}")
+            console.print(f"\n  [cyan]FROST (System Prompt Freeze):[/] {'[green]ON[/]' if enabled else '[red]OFF[/]'}  [dim]applies to the Chef proxy (route+compress) and the Compression proxy[/]")
             console.print(f"  [cyan]Safety window:[/] re-send full system after {threshold:,} non-system tokens")
             console.print(f"  [cyan]Total tokens saved:[/] [green]{total:,}[/]")
-            console.print(f"\n  [yellow]1.[/] Toggle FROST on")
-            console.print(f"  [yellow]2.[/] Toggle FROST off")
+            console.print(f"\n  [yellow]1.[/] Keep FROST off (safe default)")
+            console.print(f"  [yellow]2.[/] Disable FROST now")
             console.print(f"  [yellow]Enter.[/] Back")
+            console.print("  [dim]Enable only via CLI: `token-saver.py frost on --allow-stateless-marker` (requires a protocol that preserves the system prompt externally).[/]")
             choice = input("\n  Select: ").strip()
             if choice == "1":
                 cfg["frost"] = {"enabled": False, "allow_stateless_marker": False, "refresh_after_tokens": threshold}
                 CompressionProxy.save_config(cfg)
-                console.print("  [green][OK] FROST remains safely disabled.[/]  [dim]Use `frost on --allow-stateless-marker` only for a compatible protocol.[/]")
+                console.print("  [green][OK] FROST remains safely disabled.[/]  [dim]Enable only via `frost on --allow-stateless-marker` for a compatible protocol.[/]")
             elif choice == "2":
                 cfg.setdefault("frost", {})["enabled"] = False
                 CompressionProxy.save_config(cfg)
-                console.print("  [yellow]FROST disabled.[/]  [dim]Restart proxy to apply if running.[/]")
+                console.print("  [yellow]FROST disabled.[/]  [dim]Restart the proxy to apply if running.[/]")
+            press_any()
+
+        elif action == 'chef_menu':
+            console.clear(); banner()
+            console.print("\n  [yellow]Chef Agent Proxy[/]  [dim]combined: difficulty routing + compression + FROST[/]\n")
+            console.print("  1. Start Chef Proxy (background: routes paid->free, compresses + freezes prompts)")
+            console.print("  2. Plan a task (TODO list, tier/effort/model per step)")
+            console.print("  3. Ask a model (auto: easy->free, hard->paid)")
+            console.print("  4. Show model catalog (free + paid)")
+            console.print("  5. Route a task (recommend tier, effort, paid vs free)")
+            console.print("  6. Verify completed work (fresh-eyes check)")
+            console.print("  7. Chef Proxy Status (live savings counters)")
+            console.print("  8. Stop Chef Proxy")
+            console.print("  9. Back")
+            choice = input("\n  Select: ").strip()
+            if choice == "1":
+                ChefProxyManager.start_server()
+            elif choice == "2":
+                task = input("  Task: ").strip() or "Build a small web app"
+                console.print("  [yellow]Planning with free model...[/]")
+                try:
+                    console.print(chef_plan(task))
+                except (ChefUpstreamError, ChefConfigError) as exc:
+                    console.print(f"  [red]error: {exc}[/]")
+            elif choice == "3":
+                prompt = input("  Prompt: ").strip() or "Say hello"
+                esc = input("  Escalate on uncertainty? (y/N): ").strip().lower() == "y"
+                try:
+                    result = chef_ask(prompt)
+                    if esc and chef_is_uncertain(result):
+                        higher = chef_escalate(prompt)
+                        if higher:
+                            console.print(f"  [dim](worker uncertain -> escalating to {higher})[/]")
+                            result = chef_ask(prompt, model=higher)
+                    console.print(result)
+                except (ChefUpstreamError, ChefConfigError) as exc:
+                    console.print(f"  [red]error: {exc}[/]")
+            elif choice == "4":
+                tbl = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                tbl.add_column("Model", style="cyan")
+                tbl.add_column("Provider", style="white")
+                tbl.add_column("Score", style="yellow")
+                tbl.add_column("Key set", style="green")
+                for m in sorted(CHEF_MODELS, key=lambda x: -x["score"]):
+                    avail = "yes" if chef_provider_available(m["provider"]) else "no"
+                    tbl.add_row(m["id"], m["provider"], str(m["score"]), avail)
+                console.print(f"\n  [yellow]Chef Free Model Catalog ({len(CHEF_MODELS)})[/]\n")
+                console.print(tbl)
+                tbl2 = Table(box=box.SIMPLE, show_header=True, header_style="bold magenta")
+                tbl2.add_column("Paid Model (expert tier)", style="cyan")
+                tbl2.add_column("$/M in", style="yellow")
+                for m in sorted(CHEF_PAID_MODELS, key=lambda x: -x["score"]):
+                    tbl2.add_row(m["id"], f"{m['usd_per_m_input']:.2f}")
+                console.print(f"\n  [yellow]Chef Paid Models (budget-capped @ ${CHEF_MAX_PAID_PER_M:.2f}/M)[/]\n")
+                console.print(tbl2)
+            elif choice == "5":
+                task = input("  Task: ").strip() or "Build a small web app"
+                rec = chef_recommend(task)
+                color = {"EASY": "green", "MEDIUM": "yellow", "HARD": "red"}[rec["label"]]
+                console.print(f"\n  [cyan]Difficulty:[/] [bold {color}]{rec['label']}[/]  [dim](score {rec['score']}/100)[/]")
+                console.print(f"  [cyan]Tier:[/] [bold]{rec['tier'].upper()}[/]  [dim]{CHEF_TIER_NAMES[rec['tier']]}  |  effort={rec['effort'].upper()}[/]")
+                cost = "[magenta]PAID[/]" if rec["cost"] == "paid" else "[green]FREE[/]"
+                console.print(f"  [cyan]Recommended:[/] [bold]{rec['model_id']}[/] {cost} {rec['model_label']}")
+                higher = chef_escalate(task, rec["model_id"])
+                console.print(f"  [cyan]Escalation:[/] {higher or 'at ceiling (no higher tier)'}")
+            elif choice == "6":
+                task = input("  Task it was supposed to do: ").strip()
+                file_path = input("  Path to completed work (file): ").strip()
+                if not task:
+                    console.print("  [red]No task provided.[/]")
+                elif not file_path:
+                    console.print("  [red]No file provided.[/]")
+                else:
+                    try:
+                        work = Path(file_path).read_text(encoding="utf-8", errors="replace")
+                    except OSError as exc:
+                        console.print(f"  [red]Cannot read file: {exc}[/]")
+                    else:
+                        try:
+                            result = chef_verify(task, work)
+                        except (ChefUpstreamError, ChefConfigError) as exc:
+                            console.print(f"  [red]error: {exc}[/]")
+                        else:
+                            verdict = result["verdict"]
+                            if verdict == "PASS":
+                                console.print("  [bold green]VERDICT: PASS[/]")
+                            elif verdict == "FAIL":
+                                console.print("  [bold red]VERDICT: FAIL[/]  [dim]-> fix and re-verify[/]")
+                            else:
+                                console.print("  [yellow]VERDICT: UNKNOWN[/]")
+                            console.print("\n" + result["findings"])
+            elif choice == "7":
+                st = ChefProxyManager.status()
+                if not st["running"]:
+                    console.print(f"  [red]Chef proxy is not running.[/]  [dim]Start it first (option 1).[/]")
+                    press_any()
+                    continue
+                h = st["health"]
+                console.print(f"\n  [cyan]Chef Proxy Status[/]  [dim]http://{CHEF_HOST}:{st['port']}[/]  [dim](pid {st['pid']})[/]")
+                console.print(f"  [cyan]Status:[/] {'[green]running[/]' if st['running'] else '[red]stopped[/]'}")
+                console.print(f"  [cyan]Compression:[/] {'[green]ON[/]' if h.get('compress') else '[red]OFF[/]'}"
+                              f"  [dim](skips requests < {h.get('min_compress_tokens', 200)} tokens)[/]")
+                console.print(f"  [cyan]Chars compressed:[/] [green]{h.get('saved_chars', 0):,}[/]  [dim](~{h.get('saved_chars', 0) // 4:,} tokens)[/]")
+                console.print(f"  [cyan]FROST tokens saved:[/] [green]{h.get('frost_saved_tokens', 0):,}[/]")
+                prov = h.get("providers", {})
+                ready = [p for p, v in prov.items() if v and p != "ollama"] + (["ollama"] if prov.get("ollama") else [])
+                console.print(f"  [cyan]Providers ready:[/] {', '.join(ready) if ready else '[red]none[/]'}")
+                lt = (h.get("ledger") or {}).get("today") or {}
+                if lt.get("requests"):
+                    console.print(f"  [cyan]Today:[/] [green]{lt.get('requests', 0)}[/] requests | "
+                                  f"[green]{lt.get('tokens_saved', 0):,}[/] tokens saved | "
+                                  f"[bold green]${lt.get('usd_saved', 0.0):.4f}[/] estimated saved")
+                try:
+                    week = _chef_ledger.week_series(7)
+                except Exception:
+                    week = []
+                if week and any(w["requests"] for w in week):
+                    console.print("\n  [cyan]Last 7 days (estimated USD saved):[/]")
+                    for line in chef_chart_lines(week):
+                        console.print(line)
+                console.print("  [dim]Counters reset on restart; the ledger persists. Audit log: /log (menu -> chef proxy-log).[/]")
+            elif choice == "8":
+                ChefProxyManager.stop_server()
             press_any()
 
         elif action == 'compare':
@@ -5758,7 +6253,7 @@ def interactive_menu():
     console.print("\n  [yellow]Bye! Restart opencode if you changed anything.[/]")
 
 if __name__ == "__main__":
-    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "frost", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh"}
+    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "frost", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh", "chef"}
     first = sys.argv[1] if len(sys.argv) > 1 else ""
     if len(sys.argv) == 1:
         try: interactive_menu()
