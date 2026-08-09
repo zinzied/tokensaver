@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Token Saver CLI v9.0 — Compare providers, compress context, save tokens (lean-ctx + ctxrs/ctx inspired)"""
+"""Token Saver CLI v9.5 — Compare providers, compress context, save tokens (lean-ctx + ctxrs/ctx inspired)"""
 
 import json, os, re, sys, shutil, subprocess, time, glob, concurrent.futures, hashlib, threading, io, struct, tempfile, http.server
 from pathlib import Path
@@ -86,7 +86,7 @@ SNAPSHOT_PATH = CONFIG_PATH.parent / "models_snapshot.json"
 CACHE_TTL   = 86400
 MAX_BACKUPS = 5
 BACKUP_DIR  = CONFIG_PATH.parent
-TS_VERSION  = "9.0"
+TS_VERSION  = "9.5"
 
 COMPRESS_DIR    = CONFIG_PATH.parent / "compress"
 CONTENT_CACHE   = COMPRESS_DIR / "cache"
@@ -1062,6 +1062,7 @@ def show_cost_projection(catalog: dict, model_id: str, small_id: str):
     if m or s: console.print("  [green]+ compression saves 60-90% on reads/shell[/]")
 
 @click.group()
+@click.version_option(version=TS_VERSION, prog_name="token-saver", message="%(prog)s, version %(version)s")
 def cli():
     """Token Saver - Compare providers & models, compress context, save tokens.
     Commands: set, save-max, save-money, compare, free, providers, verify,
@@ -3847,6 +3848,10 @@ def compress_read(file_path: str, mode: str, no_cache: bool, json_out: bool, ref
     content = result.get("content", "")
     console.print(content if len(content) < 5000 else content[:5000] + f"\n  [dim]... ({len(content) - 5000} more chars)[/]")
     SavingsLedger.log_entry("file_read", f"{result['mode']}:{result['file']}", result.get("size_bytes", 0) // 4, result.get("compressed_tokens", 0), {"file": result['file'], "mode": result['mode'], "cached": cached})
+    if INDEX_AVAILABLE:
+        _index_log_event("file_read", f"{result['mode']}:{result['file']}", result.get("size_bytes", 0) // 4, result.get("compressed_tokens", 0))
+        if cached:
+            _index_log_cache(result['file'], result.get("compressed_tokens", 0))
 
 @compress.command(name="shell")
 @click.argument("command_str", nargs=-1, required=True)
@@ -3874,6 +3879,8 @@ def compress_shell(command_str: tuple[str], json_out: bool, raw: bool):
     console.print(f"  [cyan]Raw tokens:[/] {result['raw_tokens']:,} -> [green]{result['compressed_tokens']:,}[/]\n")
     console.print(result["compressed_output"])
     SavingsLedger.log_entry("shell", f"{result['handler']}:{cmd[:80]}", result["raw_tokens"], result["compressed_tokens"], {"command": cmd, "handler": result['handler']})
+    if INDEX_AVAILABLE:
+        _index_log_event("shell", f"{result['handler']}:{cmd[:80]}", result["raw_tokens"], result["compressed_tokens"])
 
 @compress.command(name="messages")
 @click.option("--model", default="default", help="Model name")
@@ -3948,6 +3955,8 @@ def compress_batch(directory: str, mode: str, recursive: bool, ext: str, exclude
     console.print(f"  [cyan]Total compressed:[/] {total_compressed:,}")
     console.print(f"  [cyan]Total saved:[/] [green]{total_saved:,} tokens ({pct:.1f}%)[/]")
     SavingsLedger.log_entry("batch", f"batch {mode}:{directory}", total_raw, total_compressed, {"directory": directory, "mode": mode, "files": len(results)})
+    if INDEX_AVAILABLE:
+        _index_log_event("batch", f"batch {mode}:{directory}", total_raw, total_compressed)
 
 @compress.command(name="semantic")
 @click.argument("file_path", type=click.Path(exists=True))
@@ -3973,6 +3982,8 @@ def compress_semantic(file_path: str, max_tokens: int, json_out: bool):
     content = result.get("content", "")
     console.print(content[:3000] + (f"\n  [dim]... ({len(content) - 3000} more chars)[/]" if len(content) > 3000 else ""))
     SavingsLedger.log_entry("semantic", f"semantic:{result['file']}", result.get("size_bytes", 0) // 4, result.get("compressed_tokens", 0), {"file": result['file'], "model": result.get("model_used", "")})
+    if INDEX_AVAILABLE:
+        _index_log_event("semantic", f"semantic:{result['file']}", result.get("size_bytes", 0) // 4, result.get("compressed_tokens", 0))
 
 @cli.group()
 def cache():
@@ -4431,22 +4442,20 @@ def chef_proxy_status():
 @chef.command(name="proxy-log")
 @click.option("-n", "--num", default=20, help="how many recent entries to show (max 100)")
 def chef_proxy_log(num: int):
-    """Show the recent request audit log from the running Chef proxy"""
+    """Show the recent request audit log from the running Chef proxy (falls back to persisted ledger)"""
     st = ChefProxyManager.status()
-    if not st["running"]:
-        console.print("  [red]Chef proxy is not running.[/]")
-        return
-    import urllib.request as _ur
-    url = f"http://{CHEF_HOST}:{st['port']}/log?n={max(1, min(num, 100))}"
     entries = []
     total = 0
-    try:
-        with _ur.urlopen(url, timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        entries = data.get("entries", [])
-        total = data.get("count", len(entries))
-    except Exception:
-        pass
+    if st["running"]:
+        import urllib.request as _ur
+        url = f"http://{CHEF_HOST}:{st['port']}/log?n={max(1, min(num, 100))}"
+        try:
+            with _ur.urlopen(url, timeout=3) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            entries = data.get("entries", [])
+            total = data.get("count", len(entries))
+        except Exception:
+            pass
     if not entries:
         entries = _chef_ledger.recent(max(1, min(num, 100)))
         total = len(entries)
@@ -4733,6 +4742,7 @@ def mcp_start(transport: str, port: int):
     if INDEX_AVAILABLE:
         _init_index()
     try:
+        sys.modules.setdefault("token_saver", sys.modules[__name__])
         from token_mcp import run_mcp_stdio, run_mcp_http
         if transport == "stdio":
             console.print("  [dim]Listening on stdin/stdout (JSON-RPC 2.0)[/]")
@@ -4881,12 +4891,18 @@ if _ROUTER_AVAILABLE:
         fn = token_filters.auto_detect_filter(t)
         if fn:
             compressed = token_filters.safe_apply(fn, t)
+            if len(compressed) >= len(t):
+                compressed = t
+                fallback_note = "  [yellow]Filter matched but would expand the input — kept original (safe fallback).[/]"
+            else:
+                fallback_note = ""
             saved = len(t) - len(compressed)
             pct = (saved / len(t)) * 100 if len(t) > 0 else 0
             console.print(f"\n  [cyan]Filter:[/] [green]{fn.__name__}[/]")
             console.print(f"  [cyan]Original:[/] {len(t):,} chars")
             console.print(f"  [cyan]Compressed:[/] {len(compressed):,} chars")
             console.print(f"  [cyan]Saved:[/] [green]{saved:,} chars ({pct:.1f}%)[/]")
+            if fallback_note: console.print(fallback_note)
             console.print(f"\n  [yellow]Result:[/]\n{compressed}")
         else:
             console.print("  [yellow]No matching RTK filter found for this text.[/]")
@@ -4923,7 +4939,11 @@ if _ROUTER_AVAILABLE:
         t = " ".join(text)
         fn = token_filters.auto_detect_filter(t)
         if fn:
-            console.print(f"  [green]Detected filter:[/] {fn.__name__}")
+            compressed = token_filters.safe_apply(fn, t)
+            if len(compressed) >= len(t):
+                console.print(f"  [yellow]Detected filter:[/] {fn.__name__}  [dim](would expand — kept original)[/]")
+            else:
+                console.print(f"  [green]Detected filter:[/] {fn.__name__}")
         else:
             console.print("  [yellow]No filter matched[/]")
 
@@ -5010,6 +5030,12 @@ if _ROUTER_AVAILABLE:
                     f"${s.get('cost', 0):.4f}" if s.get("cost") else ""
                 )
             console.print(tbl)
+
+    @quota.command(name="status")
+    @click.argument("provider", required=False)
+    def quota_status(provider):
+        """Alias for `show` — display quota usage for all providers or one"""
+        quota_show(provider)
 
     @quota.command(name="update")
     @click.argument("provider")
@@ -6253,7 +6279,7 @@ def interactive_menu():
     console.print("\n  [yellow]Bye! Restart opencode if you changed anything.[/]")
 
 if __name__ == "__main__":
-    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "frost", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh", "chef"}
+    known_commands = {"set", "save-max", "save-money", "compare", "free", "providers", "verify", "restore", "health", "recommend", "heatmap", "compress", "cache", "proxy", "frost", "budget", "savings", "store", "fallback", "dashboard", "search", "sql", "stats", "mcp", "skill", "upgrade", "--help", "-h", "--version", "-V", "rtk", "caveman", "translate", "quota", "accounts", "routing", "token-refresh", "chef"}
     first = sys.argv[1] if len(sys.argv) > 1 else ""
     if len(sys.argv) == 1:
         try: interactive_menu()

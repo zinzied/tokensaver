@@ -436,12 +436,32 @@ def import_from_legacy():
     compress_dir = DB_PATH.parent
     imported = 0
 
+    # Deduplicate against rows already present (live logging may have added them),
+    # so repeated `python token_index.py` runs never double-count events.
+    conn = _connect()
+    try:
+        existing = {tuple(r) for r in conn.execute(
+            "SELECT kind, description, raw_tokens, compressed_tokens FROM events"
+        ).fetchall()}
+    finally:
+        conn.close()
+
+    def _skip(entry):
+        key = (entry.get("kind", "unknown"), entry.get("description", ""),
+               entry.get("raw_tokens", 0), entry.get("compressed_tokens", 0))
+        if key in existing:
+            return True
+        existing.add(key)
+        return False
+
     # Import savings ledger
     ledger_path = compress_dir / "savings_ledger.json"
     if ledger_path.exists():
         try:
             entries = json.loads(ledger_path.read_text("utf-8"))
             for entry in entries:
+                if _skip(entry):
+                    continue
                 log_event(
                     kind=entry.get("kind", "unknown"),
                     description=entry.get("description", ""),

@@ -1,7 +1,7 @@
 ---
 name: token-saver
 description: Use token-saver to compress file reads, shell output, and API requests before sending to expensive models. Reduces token waste by 60-90%.
-version: 9.0
+version: 9.5
 ---
 
 # Token Saver Skill

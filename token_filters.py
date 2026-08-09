@@ -796,7 +796,8 @@ def safe_apply(fn, text):
         return text
     try:
         out = fn(text)
-        if not isinstance(out, str):
+        if not isinstance(out, str) or not out or len(out) >= len(text):
+            # Never let a filter expand the payload: fall back to raw text.
             return text
         return out
     except Exception as e:

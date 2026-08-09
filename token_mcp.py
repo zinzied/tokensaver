@@ -221,7 +221,7 @@ def run_mcp_stdio():
                     "capabilities": {"tools": {}},
                     "serverInfo": {
                         "name": "token-saver",
-                        "version": "9.0",
+                        "version": "9.5",
                     },
                 },
             }
@@ -284,7 +284,7 @@ def run_mcp_http(port: int = None):
                 result = {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "token-saver", "version": "9.0"},
+                    "serverInfo": {"name": "token-saver", "version": "9.5"},
                 }
             elif method == "tools/list":
                 result = {"tools": TOOLS}

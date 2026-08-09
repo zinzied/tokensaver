@@ -1,5 +1,12 @@
 import argparse
 import sys
+from pathlib import Path
+
+# Support both `python -m chef` and a bare `python chef` directory run: the
+# latter executes this file as a script with no parent package on sys.path.
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "chef"
 
 from . import config
 from .ask import ask
