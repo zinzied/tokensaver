@@ -3091,6 +3091,58 @@ class PH(http.server.BaseHTTPRequestHandler):
                     elif path_only.endswith("/models"):
                         upstream = _mu + "/models"
         except: pass
+        # Rate-limit aware rerouting: if the requested model's provider is
+        # currently marked rate-limited, transparently switch to a healthy
+        # fallback provider (kills client retry loops against dead quotas).
+        _override_auth = ""
+        try:
+            if data is not None and isinstance(data, dict):
+                _rl_state = _load_rl_state()
+                _in_rl = False
+                _rl_key = ""
+                for _cand in (_orig_model, model_id):
+                    if _cand and _cand in _rl_state:
+                        _in_rl, _rl_key = True, _cand
+                        break
+                    if _cand and "/" in _cand and _cand.split("/")[0] in _rl_state:
+                        _in_rl, _rl_key = True, _cand.split("/")[0]
+                        break
+                if not _in_rl:
+                    for _alt in set(x for x in (_orig_model, model_id, "opencode") if x):
+                        if _alt in _rl_state:
+                            _in_rl, _rl_key = True, _alt
+                            break
+                if _in_rl:
+                    _exclude = _rl_key.split("/")[0] if "/" in _rl_key else _rl_key
+                    if _exclude == "big-pickle":
+                        _exclude = "opencode"
+                    _fb = _pick_fallback(_exclude)
+                    if _fb:
+                        _fp, _fshort = _fb
+                        data["model"] = _fshort
+                        try:
+                            nb = re.sub(r'"model"\s*:\s*"[^"]*"', '"model":"' + _fshort.replace('"', '') + '"', nb, count=1)
+                            body = re.sub(r'"model"\s*:\s*"[^"]*"', '"model":"' + _fshort.replace('"', '') + '"', body, count=1)
+                        except Exception:
+                            pass
+                        model_id = _fp + "/" + _fshort
+                        _fu = _PROVIDER_UPSTREAM[_fp]
+                        if path_only.endswith("/chat/completions"):
+                            upstream = _fu + "/chat/completions"
+                        elif path_only.endswith("/responses"):
+                            upstream = _fu + "/responses"
+                        elif path_only.endswith("/messages"):
+                            upstream = _fu + "/messages"
+                        else:
+                            upstream = _fu + path_only
+                        _override_auth = "Bearer " + _auth_file_key(_fp)
+                        try:
+                            with open(pathlib.Path.home() / ".config" / "opencode" / "compress" / "proxy_debug.log", "a", encoding="utf-8") as lf:
+                                lf.write("REROUTE %s -> %s/%s upstream=%s\n" % (_orig_model, _fp, _fshort, upstream))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         if not upstream or not str(upstream).startswith("http"):
             self.send_response(502)
             self.send_header("Content-Type", "application/json")
@@ -3126,6 +3178,9 @@ class PH(http.server.BaseHTTPRequestHandler):
         hdrs.setdefault("Content-Type", "application/json")
         hdrs.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         hdrs.setdefault("Accept", "text/event-stream, application/json")
+        if _override_auth:
+            hdrs["Authorization"] = _override_auth
+            hdrs.pop("x-api-key", None)
         _logf = r"''' + str(COMPRESS_DIR / "proxy_debug.log").replace("\\", "\\\\") + r'''"
         def _plog(msg):
             try:
@@ -3195,8 +3250,32 @@ class PH(http.server.BaseHTTPRequestHandler):
                     pass
             if _is_err:
                 _plog("HTTP %s path=%s upstream=%s req_model=%s resp=%s" % (_up_status, path_only, upstream, _orig_model, _err_body[:1000].decode("utf-8","replace")))
+                try:
+                    _etext = _err_body[:2000].decode("utf-8", "replace")
+                    if _up_status == 429 or "rate limit" in _etext.lower() or "FreeUsageLimit" in _etext:
+                        _free = ("FreeUsageLimit" in _etext) or ("Free usage exceeded" in _etext) or ("subscribe to Go" in _etext)
+                        _up_pid = ""
+                        for _p2, _u2 in _PROVIDER_UPSTREAM.items():
+                            if _u2 and str(_u2) in str(upstream):
+                                _up_pid = _p2
+                                break
+                        _mark_provider_limited(_up_pid or "opencode", _orig_model, 1800 if _free else 120)
+                except Exception:
+                    pass
         except urllib.error.HTTPError as e:
             body_err = e.read()
+            try:
+                _etext2 = body_err[:2000].decode("utf-8", "replace")
+                if e.code == 429 or "rate limit" in _etext2.lower() or "FreeUsageLimit" in _etext2:
+                    _free2 = ("FreeUsageLimit" in _etext2) or ("Free usage exceeded" in _etext2) or ("subscribe to Go" in _etext2)
+                    _up_pid2 = ""
+                    for _p3, _u3 in _PROVIDER_UPSTREAM.items():
+                        if _u3 and str(_u3) in str(upstream):
+                            _up_pid2 = _p3
+                            break
+                    _mark_provider_limited(_up_pid2 or "opencode", _orig_model, 1800 if _free2 else 120)
+            except Exception:
+                pass
             try:
                 self.send_response(e.code)
                 ct = e.headers.get("Content-Type", "application/json") if e.headers else "application/json"
@@ -3453,6 +3532,86 @@ try:
             for _mkey in _models.keys():
                 _MODEL_PROVIDER.setdefault(_mkey, []).append(_pid)
 except: pass
+
+def _auth_file_key(pid):
+    """API key/refresh token for a provider from opencode auth.json."""
+    try:
+        _ap = pathlib.Path.home() / ".local" / "share" / "opencode" / "auth.json"
+        _a = json.load(open(_ap, encoding="utf-8"))
+        _e = (_a or {}).get(pid) or {}
+        return str(_e.get("access") or _e.get("key") or _e.get("refresh") or "")
+    except Exception:
+        return ""
+
+def _load_rl_state():
+    """provider -> rate_limited_until epoch (only future entries)."""
+    try:
+        from datetime import datetime
+        _qp = pathlib.Path.home() / ".config" / "opencode" / "compress" / "quota_tracker.json"
+        _prov = (json.load(open(_qp, encoding="utf-8")).get("providers") or {})
+        _now = time.time()
+        _out = {}
+        for _p, _v in _prov.items():
+            _u = (_v or {}).get("rate_limited_until")
+            if not _u:
+                continue
+            try:
+                _t = datetime.fromisoformat(str(_u).replace("Z", "+00:00")).timestamp()
+                if _t > _now:
+                    _out[_p] = _t
+            except Exception:
+                pass
+        return _out
+    except Exception:
+        return {}
+
+def _pick_fallback(exclude_pid):
+    """First healthy (not rate-limited, credentialed, known-upstream) (pid, short_model).
+    Prefers the user's working zai key before policy recommendations."""
+    _rl = _load_rl_state()
+    if exclude_pid != "zai" and "zai" not in _rl:
+        _zu = _PROVIDER_UPSTREAM.get("zai") or ""
+        if _zu and f"127.0.0.1:{_PROXY_PORT}" not in _zu and _auth_file_key("zai"):
+            return ("zai", "glm-4.5-flash")
+    try:
+        _sp = pathlib.Path.home() / ".config" / "opencode" / "compress" / "saver_policy.json"
+        _rec = (json.load(open(_sp, encoding="utf-8")).get("last_recommendation") or {})
+    except Exception:
+        _rec = {}
+    _cands = [_rec.get("small_model"), _rec.get("main_model")]
+    _cands += list((_rec.get("fallbacks") or []))
+    for _c in _cands:
+        if not _c or "/" not in _c:
+            continue
+        _pid = _c.split("/")[0]
+        if _pid == exclude_pid or _pid in _rl:
+            continue
+        _pu = _PROVIDER_UPSTREAM.get(_pid) or ""
+        if not _pu or f"127.0.0.1:{_PROXY_PORT}" in _pu:
+            continue
+        if not _auth_file_key(_pid):
+            continue
+        return (_pid, _c[len(_pid) + 1:])
+    return None
+
+def _mark_provider_limited(pid, mid, seconds=1800):
+    """Persist a cooldown so reroute kicks in on the NEXT request (atomic replace)."""
+    try:
+        from datetime import datetime, timedelta, timezone
+        _qp = pathlib.Path.home() / ".config" / "opencode" / "compress" / "quota_tracker.json"
+        try:
+            _q = json.load(open(_qp, encoding="utf-8"))
+        except Exception:
+            _q = {"providers": {}, "accounts": {}}
+        _q.setdefault("providers", {}).setdefault(pid, {})
+        _q["providers"][pid]["rate_limited_until"] = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+        _q["providers"][pid]["rate_limited_model"] = mid or pid
+        _tmp = str(_qp) + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
+            _f.write(json.dumps(_q, indent=2))
+        os.replace(_tmp, _qp)
+    except Exception:
+        pass
 # Validate upstream is reachable before accepting traffic
 _base = UPSTREAM_MAP.get("__base__", "")
 if _base:
@@ -3582,12 +3741,27 @@ Server(("127.0.0.1",''' + str(port) + r'''),PH).serve_forever()
                     saved_urls[pid] = PROVIDER_DEFAULT_BASE_URLS.get(pid, "")
         all_configured = set(get_providers_from_env())
         all_configured.update(get_providers_from_auth())
-        cur_provider = (oc_cfg.get("model", "") or "").split("/")[0]
-        if cur_provider:
-            all_configured.add(cur_provider)
+        # NOTE: do NOT merge get_providers_from_model_history() here — its
+        # `variant` keys contain dozens of stale providers ever touched and
+        # would spam the NOT-proxied warning. Config + live current model is
+        # authoritative for what needs proxying.
+        all_configured.update((oc_cfg.get("provider", {}) or {}).keys())
+        for _m in ((oc_cfg.get("model", "") or ""), (oc_cfg.get("small_model", "") or ""), get_current_model()):
+            _pid = (_m or "").split("/")[0] if "/" in (_m or "") else ""
+            if _pid:
+                all_configured.add(_pid)
+        # Keep any provider explicitly pointed at the proxy in opencode.jsonc,
+        # even when it has no env key / auth.json entry (e.g. opencode Zen
+        # subscription models like muse-spark authenticate without env keys).
+        # Only drop stale proxy.json entries that are nowhere to be found.
         for pid in list(proxied):
             if pid not in all_configured:
-                proxied.remove(pid)
+                _pconf = (oc_cfg.get("provider", {}) or {}).get(pid)
+                _bu = ""
+                if isinstance(_pconf, dict):
+                    _bu = ((_pconf.get("options", {}) or {}).get("baseURL", "") or "")
+                if not (_bu and proxy_url in _bu):
+                    proxied.remove(pid)
         not_proxied = sorted(p for p in all_configured
                              if p in PROVIDER_DEFAULT_BASE_URLS and p not in proxied)
         return {

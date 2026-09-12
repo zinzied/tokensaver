@@ -1,0 +1,31 @@
+{
+  "name": "token-saver-cli",
+  "version": "10.0.0",
+  "description": "Token Saver v10 — reduce token waste and spending when using AI coding models (TypeScript + Ink TUI)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "token-saver": "dist/index.js"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "tsx src/index.tsx",
+    "dev": "tsx src/index.tsx",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.0"
+  }
+}
