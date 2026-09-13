@@ -162,10 +162,121 @@ def main() -> int:
         post_json(proxy_url, large)
         time.sleep(0.1)
         forwarded_large = len(UpstreamHandler.received[-1])
-        # Large conversations are intentionally bypassed by the proxy's safety
-        # rule; this guards against accidental truncation of complex payloads.
-        if raw_large != forwarded_large:
-            raise AssertionError(f"large bypass changed payload size: {raw_large} -> {forwarded_large} bytes")
+        # Large conversations use the sliding window: the most recent 15
+        # messages keep normal caps while older messages are compressed with
+        # the tightest caps. Message count and structure must be preserved —
+        # only content strings may shrink, never grow.
+        if forwarded_large >= raw_large:
+            raise AssertionError(f"large sliding-window did not reduce payload: {raw_large} -> {forwarded_large} bytes")
+        fwd_large_body = json.loads(UpstreamHandler.received[-1])
+        if len(fwd_large_body.get("messages", [])) != 60:
+            raise AssertionError("sliding window dropped messages instead of only shrinking content")
+
+        # Anthropic-shaped request: system string must gain a native cache
+        # breakpoint (content untouched), messages preserved, tool output
+        # with repeated IDs normalized. Body is large enough that the
+        # breakpoint (~70B) cannot trip the never-expand fallback.
+        anthropic = {
+            "model": "test-model",
+            "system": "You are a careful coding assistant. " * 40,
+            "messages": [
+                {"role": "user", "content": "trace 550e8400-e29b-41d4-a716-446655440000 " * 30},
+                {"role": "user", "content": "\n".join(
+                    "2026-08-07T12:00:00Z INFO worker completed request id=%d" % (i % 4)
+                    for i in range(120)
+                )},
+            ],
+        }
+        raw_anthropic = len(json.dumps(anthropic, separators=(",", ":")).encode())
+        n_before = len(UpstreamHandler.received)
+        post_json(f"http://127.0.0.1:{proxy_port}/v1/messages", anthropic)
+        time.sleep(0.1)
+        if len(UpstreamHandler.received) != n_before + 1:
+            raise AssertionError("upstream did not receive the /messages request")
+        fwd_anthropic = json.loads(UpstreamHandler.received[-1])
+        sys_blocks = fwd_anthropic.get("system")
+        if not isinstance(sys_blocks, list) or not sys_blocks:
+            raise AssertionError("system string was not converted to blocks: %r" % type(sys_blocks))
+        if sys_blocks[-1].get("cache_control") != {"type": "ephemeral"}:
+            raise AssertionError("last system block is missing the cache breakpoint")
+        if "careful coding assistant" not in sys_blocks[-1].get("text", ""):
+            raise AssertionError("system content was altered while adding the breakpoint")
+        if len(fwd_anthropic.get("messages", [])) != 2:
+            raise AssertionError("messages were dropped from the /messages request")
+        forwarded_anthropic = len(UpstreamHandler.received[-1])
+        if forwarded_anthropic >= raw_anthropic:
+            raise AssertionError(f"/messages request was not reduced: {raw_anthropic} -> {forwarded_anthropic} bytes")
+
+        # Client-set breakpoints must be respected, never duplicated.
+        preset = {
+            "model": "test-model",
+            "system": [
+                {"type": "text", "text": "Stable preamble. " * 60,
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "Trailing note."},
+            ],
+            "messages": [{"role": "user", "content": "hello " * 100}],
+        }
+        n_before = len(UpstreamHandler.received)
+        post_json(f"http://127.0.0.1:{proxy_port}/v1/messages", preset)
+        time.sleep(0.1)
+        fwd_preset = json.loads(UpstreamHandler.received[-1])
+        ccs = [b.get("cache_control") for b in fwd_preset.get("system", [])
+               if isinstance(b, dict) and "cache_control" in b]
+        if ccs != [{"type": "ephemeral"}]:
+            raise AssertionError("client cache breakpoints were altered: %r" % ccs)
+
+        # Non-JSON request body: json.loads fails, so `data` is never bound in
+        # do_POST. The proxy must answer with the upstream response instead of
+        # crashing the request thread (UnboundLocalError) and dropping the
+        # connection, which opencode sees as a dead proxy.
+        n_before = len(UpstreamHandler.received)
+        raw_req = urllib.request.Request(
+            proxy_url,
+            data=b"this is not json at all",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer local-test"},
+            method="POST",
+        )
+        with urllib.request.urlopen(raw_req, timeout=15) as response:
+            non_json_resp = response.read()
+        json.loads(non_json_resp)  # must be a real HTTP response, not a dead connection
+        time.sleep(0.1)
+        if len(UpstreamHandler.received) != n_before + 1:
+            raise AssertionError("non-JSON body was not forwarded upstream")
+        if UpstreamHandler.received[-1] != b"this is not json at all":
+            raise AssertionError("non-JSON body was altered: %r" % UpstreamHandler.received[-1])
+
+        # Responses-API shaped request (/v1/responses, used by opencode Zen and
+        # Codex): structure must survive compression — same item count and
+        # types, reasoning blocks untouched, and the body must shrink.
+        responses = {
+            "model": "test-model",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "Explain this log:\n" + repeated_logs}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "I will look at the output. " * 400}],
+                 "reasoning": [{"type": "encrypted_content", "encrypted_content": "abc123"}]},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+            ],
+            "stream": False,
+        }
+        n_before = len(UpstreamHandler.received)
+        post_json(f"http://127.0.0.1:{proxy_port}/v1/responses", responses)
+        time.sleep(0.1)
+        if len(UpstreamHandler.received) != n_before + 1:
+            raise AssertionError("upstream did not receive the /v1/responses request")
+        fwd_responses = json.loads(UpstreamHandler.received[-1])
+        items = fwd_responses.get("input", [])
+        if len(items) != 3:
+            raise AssertionError("responses input items were dropped: %d" % len(items))
+        if [it.get("type") for it in items] != ["message", "message", "function_call_output"]:
+            raise AssertionError("responses item types changed: %r" % [it.get("type") for it in items])
+        if items[1].get("reasoning") != [{"type": "encrypted_content", "encrypted_content": "abc123"}]:
+            raise AssertionError("assistant reasoning block was altered")
+        raw_responses = len(json.dumps(responses, separators=(",", ":")).encode())
+        if len(UpstreamHandler.received[-1]) >= raw_responses:
+            raise AssertionError(f"/v1/responses request was not reduced: {raw_responses} -> {len(UpstreamHandler.received[-1])} bytes")
 
         generated = (work_dir / "_proxy_server.py").read_text(encoding="utf-8")
         if "allow_stateless_marker" not in generated:
@@ -173,7 +284,11 @@ def main() -> int:
 
         print("Proxy self-test: PASS")
         print(f"  compressible request: {raw_small:,} -> {forwarded_small:,} bytes ({small_saved:,} saved, {small_saved / raw_small * 100:.1f}%)")
-        print(f"  large-request bypass: {raw_large:,} -> {forwarded_large:,} bytes (unchanged by design)")
+        print(f"  large-request sliding window: {raw_large:,} -> {forwarded_large:,} bytes (60 msgs preserved, content shrunk)")
+        print(f"  anthropic /messages: {raw_anthropic:,} -> {forwarded_anthropic:,} bytes (cache breakpoint set, system intact)")
+        print("  client breakpoints: respected, never duplicated")
+        print("  non-JSON body: forwarded untouched, request thread not crashed")
+        print("  responses /v1/responses: structure + reasoning preserved, body reduced")
         print("  FROST safety gate: present in generated proxy")
         print("  Note: bytes are a transport measurement; provider billing must be verified with that provider's usage data.")
         return 0

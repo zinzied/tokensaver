@@ -2661,6 +2661,18 @@ class CompressionProxy:
     @staticmethod
     def start_server(port: int = None, provider: str | None = None, configure_opencode: bool = True, no_frost: bool = False) -> bool:
         cfg = CompressionProxy.config()
+        # Adaptive sync: even if a proxy is already running, refresh the
+        # OpenCode config so providers added to env/auth.json/config since the
+        # last start are routed through the proxy too (no manual edits).
+        if configure_opencode and cfg.get("port", CompressionProxy.PROXY_PORT):
+            try:
+                CompressionProxy._apply_opencode_config(cfg.get("port", CompressionProxy.PROXY_PORT))
+                cfg = CompressionProxy.config()
+                if not cfg.get("saved_base_urls") and provider:
+                    CompressionProxy._configure_env_providers(cfg.get("port", CompressionProxy.PROXY_PORT), cfg, provider)
+                cfg = CompressionProxy.config()
+            except Exception:
+                pass
         if cfg.get("enabled") and cfg.get("pid"):
             console.print("  [yellow]Proxy is already running.[/]"); return False
         try:
@@ -2677,7 +2689,7 @@ class CompressionProxy:
                         pricing[m["id"]] = {"input": m["input_price"], "output": m["output_price"]}
                 COST_PRICING_PATH.write_text(json.dumps(pricing, indent=2), encoding="utf-8")
             except: pass
-            script = r'''import json, sys, http.server, hashlib, re, urllib.request, urllib.error, os, pathlib, time
+            script = r'''import json, sys, http.server, hashlib, re, urllib.request, urllib.error, os, pathlib, time, threading
 try:
     import requests as _req
 except Exception:
@@ -2710,6 +2722,7 @@ def _get_session():
                 pass
     return _session
 UPSTREAM_MAP = {}
+_STATE_LOCK = threading.Lock()  # serializes proxy.json read-modify-write in do_POST
 PROVIDER_DEFAULT_BASE_URLS = ''' + repr(PROVIDER_DEFAULT_BASE_URLS) + r'''
 _PRICES = {}
 _pf = r"''' + str(COST_PRICING_PATH).replace("\\", "\\\\") + r'''"
@@ -2830,6 +2843,7 @@ class PH(http.server.BaseHTTPRequestHandler):
         model_id = ""
         _orig_model = ""
         _frost_saved = 0
+        data = None  # json.loads may fail (empty/truncated/non-JSON body); never leave it unbound
         try:
             data = json.loads(body)
             msgs = data.get("messages", [])
@@ -2844,9 +2858,14 @@ class PH(http.server.BaseHTTPRequestHandler):
                 if prefix in PROVIDER_DEFAULT_BASE_URLS or prefix in ("opencode", "opencode-go"):
                     data["model"] = model_id[len(prefix)+1:]
                     model_id = data["model"]
-            # Skip compression for very large conversations (>50 msgs or >100KB)
-            # to avoid corrupting tool calls and complex content structures.
-            _skip_compress = len(msgs) > 50 or len(body) > 100000
+            # Sliding window for very large conversations (>50 msgs or >100KB):
+            # instead of skipping compression entirely (which yields 0 savings),
+            # keep the most recent 15 messages on normal caps and compress older
+            # messages with the tightest caps. Message count and structure
+            # (roles, tool_calls) are always preserved — only content shrinks.
+            _oversized = len(msgs) > 50 or len(body) > 100000
+            _window_keep = 15
+            _split_at = len(msgs) - _window_keep if (_oversized and isinstance(msgs, list) and len(msgs) > _window_keep) else 0
             # FROST: collapse an unchanged system prompt to a marker. Runs before
             # the content pipeline and applies even to very large conversations.
             try:
@@ -2856,8 +2875,9 @@ class PH(http.server.BaseHTTPRequestHandler):
             comp = []
             # 1) JSON Crusher: statistical JSON array compression
             # 2) Log Compressor: deduplicate repetitive log lines
-            # 3) Cache Aligner: relocate volatile fields out of cacheable prefix
-            # 4) Fallback truncation for oversized plain text
+            # 3) RTK: tool-output shapes (git diff, grep, build logs, repeats)
+            # 4) Cache Aligner: relocate volatile fields out of cacheable prefix
+            # 5) Fallback truncation for oversized plain text
             cl = _cost_level(model_id)
             sys_limit = {"free":1200,"cheap":2000,"moderate":600,"expensive":250}
             def _json_crush(text):
@@ -2907,19 +2927,100 @@ class PH(http.server.BaseHTTPRequestHandler):
                         for j in range(run_start, i + 1): out.append(lines[j])
                     i += 1
                 return "\n".join(out)
+            def _rtk_compress(text):
+                # Best-effort RTK tool-output compression (stdlib only): git diff
+                # hunks, grep per-file caps, build-log error extraction, plus
+                # generic duplicate-run collapse. Never raises, never expands.
+                try:
+                    if not isinstance(text, str) or len(text) < 500 or len(text) > 10 * 1024 * 1024:
+                        return text
+                    head = text[:1024]
+                    lines = text.split("\n")
+                    out = None
+                    # Grep-style hits look like path:line: (path has a slash
+                    # or file extension — rules out timestamps like 00:00:00).
+                    def _looks_like_grep(head=head):
+                        for _ln in head.split("\n")[:5]:
+                            if not _ln.strip():
+                                continue
+                            _m = re.match(r"^([^:]+):(\d+):", _ln)
+                            if _m and ("/" in _m.group(1) or "\\" in _m.group(1) or "." in _m.group(1)):
+                                return True
+                        return False
+                    if head.startswith("diff --git ") or "\ndiff --git " in head or head.startswith("@@ "):
+                        res = []; hunk_left = 0
+                        for ln in lines:
+                            if ln.startswith("diff --git ") or ln.startswith("@@ "):
+                                hunk_left = 100; res.append(ln); continue
+                            if hunk_left > 0:
+                                res.append(ln); hunk_left -= 1
+                            elif hunk_left == 0:
+                                res.append("  ... (hunk truncated)"); hunk_left = -1
+                        out = "\n".join(res)
+                    elif _looks_like_grep():
+                        seen = {}; res = []
+                        for ln in lines:
+                            m = re.match(r"^([^:]+):\d+:", ln)
+                            key = m.group(1) if m else "\0other"
+                            n = seen.get(key, 0)
+                            if n < 10: res.append(ln)
+                            elif n == 10: res.append("  ... (%s: further matches capped)" % key)
+                            seen[key] = n + 1
+                        out = "\n".join(res)
+                    elif re.search(r"npm (ERR!|warn)|BUILD (SUCCESS|FAILED)|\[ERROR\]|Compiling\s+\S+|ERROR:", head, re.IGNORECASE):
+                        keep = [l for l in lines if re.search(r"error|failed|exception|traceback|warning|BUILD (SUCCESS|FAILED)|Compiling|npm ERR!", l, re.IGNORECASE)]
+                        if keep:
+                            out = "\n".join(keep[:200])
+                            if len(lines) > len(keep):
+                                out += "\n# ... %d routine lines omitted" % (len(lines) - len(keep))
+                    if out is None:
+                        collapsed = []; i = 0
+                        while i < len(lines):
+                            norm = re.sub(r"\d+", "N", lines[i]).strip()
+                            j = i + 1
+                            while j < len(lines) and re.sub(r"\d+", "N", lines[j]).strip() == norm:
+                                j += 1
+                            run = j - i
+                            if run >= 5:
+                                collapsed.append(lines[i])
+                                collapsed.append("  [... repeated %d more times ...]" % (run - 2))
+                                collapsed.append(lines[j - 1])
+                            else:
+                                collapsed.extend(lines[i:j])
+                            i = j
+                        out = "\n".join(collapsed)
+                        if len(collapsed) >= 250:
+                            out = "\n".join(collapsed[:120] + ["# ... %d lines omitted" % (len(collapsed) - 180)] + collapsed[-60:])
+                    if not out or len(out) >= len(text):
+                        return text
+                    return out
+                except Exception:
+                    return text
             _UP = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
             _TSP = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?")
             _UX = re.compile(r"\b1[6-9]\d{8}\b")
             def _cache_align(text):
-                dyn = {}; result = text; c = 0
-                for match in _UP.finditer(result):
-                    p = f"{{UUID_{c}}}"; dyn[p] = match.group(); result = result.replace(match.group(), p, 1); c += 1
-                for match in _TSP.finditer(result):
-                    p = f"{{TS_{c}}}"; dyn[p] = match.group(); result = result.replace(match.group(), p, 1); c += 1
-                for match in _UX.finditer(result):
-                    p = f"{{TS_{c}}}"; dyn[p] = match.group(); result = result.replace(match.group(), p, 1); c += 1
-                if dyn: result += "\n# Dynamic values: " + json.dumps(dyn)
-                return result
+                # Normalize volatile IDs/timestamps to stable markers so
+                # provider prefix-caches stay hot. The ledger preserves the
+                # originals. Net-win guard: single-ID messages would grow, so
+                # return them untouched instead of expanding the payload.
+                try:
+                    if not isinstance(text, str) or len(text) < 200:
+                        return text
+                    dyn = {}; result = text; c = 0
+                    for _pattern, _prefix in ((_UP, "UUID"), (_TSP, "TS"), (_UX, "TS")):
+                        for _v in dict.fromkeys(_m.group() for _m in _pattern.finditer(result)):
+                            _p = f"{{{_prefix}_{c}}}"; c += 1
+                            dyn[_p] = _v
+                            result = result.replace(_v, _p)
+                    if not dyn:
+                        return text
+                    candidate = result + "\n# Dynamic values: " + json.dumps(dyn)
+                    if len(candidate) >= len(text):
+                        return text
+                    return candidate
+                except Exception:
+                    return text
             def _clean_msg(m):
                 return {k:v for k,v in m.items() if not (v is None or v == [] or (isinstance(v, str) and v == ""))}
             # Responses API clients (including Codex) use `input` rather than
@@ -2930,13 +3031,15 @@ class PH(http.server.BaseHTTPRequestHandler):
                 out = text
                 if len(out) > 200: out = _json_crush(out)
                 if len(out) > 200: out = _compress_log(out)
+                if len(out) > 500: out = _rtk_compress(out)
+                if len(out) > 200: out = _cache_align(out)
                 if len(out) > cap:
                     lines = out.splitlines(); keep = max(5, int(cap * 0.6) // 40)
                     if len(lines) > keep * 2:
                         out = "\n".join(lines[:keep] + [f"# ... {len(lines)-keep*2} lines omitted"] + lines[-keep:])
                     else: out = out[:cap] + f"\n# ... truncated ({len(out)-cap} chars)"
                 return out
-            if self.path.split("?", 1)[0].endswith("/responses") and not _skip_compress:
+            if self.path.split("?", 1)[0].endswith("/responses"):
                 response_cap = {"free":1500,"cheap":3000,"moderate":800,"expensive":400}.get(cl, 3000)
                 response_input = data.get("input")
                 if isinstance(response_input, str):
@@ -2954,21 +3057,23 @@ class PH(http.server.BaseHTTPRequestHandler):
             # Apply pipeline to each message content
             comp = []
             tool_result_count = 0
-            for m in msgs:
-                if _skip_compress:
-                    comp.append(m)
-                    continue
+            for _idx, m in enumerate(msgs):
                 role = m.get("role","")
                 c = m.get("content","")
+                # Sliding window: older messages in oversized histories use the
+                # tightest caps; recent messages keep normal cost-aware caps.
+                _is_old = _idx < _split_at
                 if isinstance(c, str):
                     is_tool = role in ("user", "tool") or (tool_result_count > 0 and role == "user")
                     s = c
                     if len(s) > 200: s = _json_crush(s)
                     if len(s) > 200: s = _compress_log(s)
-                    if role == "system" and len(s) > 200: s = _cache_align(s)
+                    if len(s) > 500: s = _rtk_compress(s)
+                    if len(s) > 200: s = _cache_align(s)
                     msg_limits = {"free":1500,"cheap":3000,"moderate":800,"expensive":400}
                     msg_cap = msg_limits.get(cl, 3000)
                     if role == "system": msg_cap = max(msg_cap, sys_limit.get(cl, 4000))
+                    if _is_old: msg_cap = min(msg_cap, 400)
                     if len(s) > msg_cap:
                         lines = s.splitlines()
                         cap50 = int(msg_cap * 0.6)
@@ -2985,15 +3090,41 @@ class PH(http.server.BaseHTTPRequestHandler):
                             t = b.get("text","")
                             if len(t) > 200: t = _json_crush(t)
                             if len(t) > 200: t = _compress_log(t)
+                            if len(t) > 500: t = _rtk_compress(t)
+                            if len(t) > 200: t = _cache_align(t)
                             mult_limits = {"free":800,"cheap":1500,"moderate":600,"expensive":300}
                             cap2 = mult_limits.get(cl, 2000)
+                            if _is_old: cap2 = min(cap2, 300)
                             if len(t) > cap2: t = t[:int(cap2*0.6)] + f"\n... truncated ({len(t)-int(cap2*0.6)} chars)"
                             parts.append({"type":"text","text":t})
                         else: parts.append(b)
                     comp.append(_clean_msg({"role":role,"content":parts}))
                 else: comp.append(_clean_msg(m))
-            if not _skip_compress:
+            if isinstance(msgs, list):
                 data["messages"] = comp
+            # Native prompt caching (Anthropic /messages only): tag the stable
+            # system prompt with a cache breakpoint so repeats bill as cache
+            # reads (~0.1x) instead of full price. Content is untouched — the
+            # safe counterpart to FROST markers on stateless APIs. Skipped if
+            # the client already sets its own breakpoints. OpenAI/Google cache
+            # shareable prefixes automatically, no markup needed.
+            try:
+                if self.path.split("?", 1)[0].endswith("/messages") and data.get("system") is not None:
+                    _sys = data.get("system")
+                    if isinstance(_sys, str):
+                        data["system"] = [{"type": "text", "text": _sys, "cache_control": {"type": "ephemeral"}}]
+                    elif isinstance(_sys, list):
+                        _has_cc = any(isinstance(_b, dict) and "cache_control" in _b for _b in _sys)
+                        if not _has_cc:
+                            for _blk in _sys:
+                                if isinstance(_blk, dict) and isinstance(_blk.get("text"), str):
+                                    _blk.pop("cache_control", None)
+                            for _blk in reversed(_sys):
+                                if isinstance(_blk, dict) and isinstance(_blk.get("text"), str):
+                                    _blk["cache_control"] = {"type": "ephemeral"}
+                                    break
+            except Exception:
+                pass
             nb = json.dumps(data, separators=(",",":"))
             if len(nb) > len(body):
                 nb = body
@@ -3185,7 +3316,7 @@ class PH(http.server.BaseHTTPRequestHandler):
         def _plog(msg):
             try:
                 with open(_logf, "a", encoding="utf-8") as lf:
-                    lf.write(msg + "\\n")
+                    lf.write(msg + "\n")
             except Exception:
                 pass
         _plog("REQ path=%s model_orig=%s model_fwd=%s raw_sz=%d comp_sz=%d msgs=%d frost_saved=%d" % (self.path, _orig_model, model_id, len(body), len(nb), len(data.get("messages",[])) if isinstance(data, dict) else 0, _frost_saved))
@@ -3303,16 +3434,19 @@ class PH(http.server.BaseHTTPRequestHandler):
                 pass
         # Log savings
         cf = r"''' + str(PROXY_CONFIG).replace("\\", "\\\\") + r'''"
-        try:
-            with open(cf) as f: cg = json.load(f)
-        except: cg = {}
-        cg.setdefault("history",[]).append({"path":path_only,"model":_orig_model or model_id or "unknown","saved_tokens":saved,"frost_saved":_frost_saved,"timestamp":__import__("time").time()})
-        cg["history"] = cg["history"][-200:]
-        cg["total_saved_tokens"] = cg.get("total_saved_tokens",0) + saved
-        cg["frost_total_saved_tokens"] = cg.get("frost_total_saved_tokens",0) + _frost_saved
-        try:
-            with open(cf,"w") as f: json.dump(cg,f,indent=2)
-        except: pass
+        # Single-writer: concurrent threads would race the read-modify-write
+        # and corrupt proxy.json (history/counters lost or truncated).
+        with _STATE_LOCK:
+            try:
+                with open(cf) as f: cg = json.load(f)
+            except: cg = {}
+            cg.setdefault("history",[]).append({"path":path_only,"model":_orig_model or model_id or "unknown","saved_tokens":saved,"frost_saved":_frost_saved,"timestamp":__import__("time").time()})
+            cg["history"] = cg["history"][-200:]
+            cg["total_saved_tokens"] = cg.get("total_saved_tokens",0) + saved
+            cg["frost_total_saved_tokens"] = cg.get("frost_total_saved_tokens",0) + _frost_saved
+            try:
+                with open(cf,"w") as f: json.dump(cg,f,indent=2)
+            except: pass
     def do_GET(self):
         path_only = self.path.split("?", 1)[0]
         # Proxy /v1/models so clients can discover real upstream models
@@ -3485,6 +3619,20 @@ try:
                     if _pid not in ("api", "secret", "key", "auth", "token", "bearer", ""):
                         _CONFIGURED_PROVIDERS.add(_pid)
                     break
+    # Also scan opencode auth.json so providers credentialed there (typed api
+    # keys, oauth/refresh tokens) are routed without needing a config entry.
+    for _ap0 in (pathlib.Path.home() / ".local" / "share" / "opencode" / "auth.json",
+                 pathlib.Path.home() / ".config" / "opencode" / "auth.json"):
+        if _ap0.exists():
+            try:
+                _aj = json.load(open(_ap0, encoding="utf-8"))
+                for _pid0, _e0 in (_aj or {}).items():
+                    if not isinstance(_e0, dict):
+                        continue
+                    if _e0.get("key") or _e0.get("access") or _e0.get("refresh"):
+                        _CONFIGURED_PROVIDERS.add(_pid0)
+            except Exception:
+                pass
 except: pass
 # 4) From PROVIDER_DEFAULT_BASE_URLS (fallback defaults for all known providers)
 for _pid, _url in PROVIDER_DEFAULT_BASE_URLS.items():
@@ -3709,10 +3857,20 @@ Server(("127.0.0.1",''' + str(port) + r'''),PH).serve_forever()
     @staticmethod
     def status() -> dict:
         cfg = CompressionProxy.config()
+        # Resilience: trust the live listener even if proxy.json is stale
+        # (e.g. the proxy was started by an external tool or the pid file was
+        # reset). Probe the port directly when the recorded pid is missing.
         running = False
         if cfg.get("enabled") and cfg.get("pid"):
             try: running = requests.get(f"http://127.0.0.1:{cfg.get('port',8199)}", timeout=2).ok
             except: running = False
+        if not running:
+            try:
+                _probe = requests.get(f"http://127.0.0.1:{cfg.get('port',8199)}", timeout=1)
+                if _probe.ok and "running" in (_probe.text or ""):
+                    running = True
+            except:
+                running = False
         history = cfg.get("history", [])
         models = {}
         for h in history:

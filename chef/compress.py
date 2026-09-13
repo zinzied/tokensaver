@@ -108,28 +108,117 @@ def compress_log(text):
 
 
 def cache_align(text):
-    """Replace volatile values (UUIDs, timestamps, numeric IDs) with stable markers."""
-    dyn = {}
-    result = text
-    c = 0
-    for match in _UP.finditer(result):
-        p = "{UUID_%d}" % c
-        dyn[p] = match.group()
-        result = result.replace(match.group(), p, 1)
-        c += 1
-    for match in _TSP.finditer(result):
-        p = "{TS_%d}" % c
-        dyn[p] = match.group()
-        result = result.replace(match.group(), p, 1)
-        c += 1
-    for match in _UX.finditer(result):
-        p = "{TS_%d}" % c
-        dyn[p] = match.group()
-        result = result.replace(match.group(), p, 1)
-        c += 1
-    if dyn:
-        result += "\n# Dynamic values: " + json.dumps(dyn)
-    return result
+    """Replace volatile values (UUIDs, timestamps, numeric IDs) with stable markers.
+
+    The ledger preserves the originals. Net-win guard: payloads where the
+    ledger would cost more than the markers save are returned untouched.
+    Never raises.
+    """
+    try:
+        if not isinstance(text, str) or len(text) < 200:
+            return text
+        dyn = {}
+        result = text
+        c = 0
+        for _pattern, _prefix in ((_UP, "UUID"), (_TSP, "TS"), (_UX, "TS")):
+            for _v in dict.fromkeys(_m.group() for _m in _pattern.finditer(result)):
+                _p = "{%s_%d}" % (_prefix, c)
+                c += 1
+                dyn[_p] = _v
+                result = result.replace(_v, _p)
+        if not dyn:
+            return text
+        candidate = result + "\n# Dynamic values: " + json.dumps(dyn)
+        if len(candidate) >= len(text):
+            return text
+        return candidate
+    except Exception:
+        return text
+
+
+def _rtk_compress(text):
+    """Best-effort RTK tool-output compression (stdlib only).
+
+    Mirrors token_filters.auto_detect_filter for the common shapes the proxy
+    sees (git diff, grep hits, build logs, ls/tree listings) plus generic
+    consecutive-duplicate collapse and smart head/tail truncation. Never
+    raises and never returns output larger than the input.
+    """
+    try:
+        if not isinstance(text, str) or len(text) < 500 or len(text) > 10 * 1024 * 1024:
+            return text
+        head = text[:1024]
+        lines = text.split("\n")
+        out = None
+        # Grep-style hits look like path:line: (path contains a slash or a
+        # file extension — this rules out timestamps such as 00:00:00).
+        def _looks_like_grep(head=head):
+            for _ln in head.split("\n")[:5]:
+                if not _ln.strip():
+                    continue
+                _m = re.match(r"^([^:]+):(\d+):", _ln)
+                if _m and ("/" in _m.group(1) or "\\" in _m.group(1) or "." in _m.group(1)):
+                    return True
+            return False
+        if head.startswith("diff --git ") or "\ndiff --git " in head or head.startswith("@@ "):
+            res = []
+            hunk_left = 0
+            for ln in lines:
+                if ln.startswith("diff --git ") or ln.startswith("@@ "):
+                    hunk_left = 100
+                    res.append(ln)
+                    continue
+                if hunk_left > 0:
+                    res.append(ln)
+                    hunk_left -= 1
+                elif hunk_left == 0:
+                    res.append("  ... (hunk truncated)")
+                    hunk_left = -1
+            out = "\n".join(res)
+        elif _looks_like_grep():
+            seen = {}
+            res = []
+            for ln in lines:
+                m = re.match(r"^([^:]+):\d+:", ln)
+                key = m.group(1) if m else "\0other"
+                n = seen.get(key, 0)
+                if n < 10:
+                    res.append(ln)
+                elif n == 10:
+                    res.append("  ... (%s: further matches capped)" % key)
+                seen[key] = n + 1
+            out = "\n".join(res)
+        elif re.search(r"npm (ERR!|warn)|BUILD (SUCCESS|FAILED)|\[ERROR\]|Compiling\s+\S+|ERROR:", head, re.IGNORECASE):
+            keep = [l for l in lines
+                    if re.search(r"error|failed|exception|traceback|warning|BUILD (SUCCESS|FAILED)|Compiling|npm ERR!", l, re.IGNORECASE)]
+            if keep:
+                out = "\n".join(keep[:200])
+                if len(lines) > len(keep):
+                    out += "\n# ... %d routine lines omitted" % (len(lines) - len(keep))
+        if out is None:
+            collapsed = []
+            i = 0
+            while i < len(lines):
+                norm = re.sub(r"\d+", "N", lines[i]).strip()
+                j = i + 1
+                while j < len(lines) and re.sub(r"\d+", "N", lines[j]).strip() == norm:
+                    j += 1
+                run = j - i
+                if run >= 5:
+                    collapsed.append(lines[i])
+                    collapsed.append("  [... repeated %d more times ...]" % (run - 2))
+                    collapsed.append(lines[j - 1])
+                else:
+                    collapsed.extend(lines[i:j])
+                i = j
+            out = "\n".join(collapsed)
+            if len(collapsed) >= 250:
+                out = "\n".join(collapsed[:120] + ["# ... %d lines omitted" % (len(collapsed) - 180)] + collapsed[-60:])
+        if not out or len(out) >= len(text):
+            return text
+        return out
+    except Exception:
+        return text
 
 
 def _clean_msg(m):
@@ -147,12 +236,16 @@ def _truncate(text, cap):
 
 
 def compress_text(text, cap):
-    """Full content pipeline: crush -> log-dedup -> truncate to cap."""
+    """Full content pipeline: crush -> log-dedup -> RTK -> cache-align -> truncate."""
     if not isinstance(text, str) or len(text) <= 200:
         return text
     out = json_crush(text)
     if len(out) > 200:
         out = compress_log(out)
+    if len(out) > 500:
+        out = _rtk_compress(out)
+    if len(out) > 200:
+        out = cache_align(out)
     if len(out) > cap:
         out = _truncate(out, cap)
     return out
@@ -160,17 +253,28 @@ def compress_text(text, cap):
 
 def compress_messages(messages, level="cheap"):
     """Apply the pipeline to an OpenAI-style messages list, in place.
-    Returns (saved_chars, msg_count)."""
+    Returns (saved_chars, msg_count).
+
+    Sliding window: histories longer than 50 messages are NOT skipped.
+    The most recent 15 messages use the requested `level` caps; older
+    messages are compressed with the tightest ("expensive") caps since
+    they are context, not the current task. Message count and structure
+    (roles, tool_calls) are always preserved — only content strings shrink.
+    """
     if not isinstance(messages, list):
         return 0, 0
-    msg_cap = MSG_LIMITS.get(level, 3000)
-    sys_cap = SYS_LIMITS.get(level, 4000)
-    mult_cap = MULT_LIMITS.get(level, 2000)
+    window_keep = 15
+    sliding = len(messages) > 50
+    split_at = len(messages) - window_keep if sliding else 0
     tool_result_count = 0
     before = len(json.dumps(messages, ensure_ascii=False))
-    for m in messages:
+    for idx, m in enumerate(messages):
         if not isinstance(m, dict):
             continue
+        eff = level if (not sliding or idx >= split_at) else "expensive"
+        msg_cap = MSG_LIMITS.get(eff, 3000)
+        sys_cap = SYS_LIMITS.get(eff, 4000)
+        mult_cap = MULT_LIMITS.get(eff, 2000)
         role = m.get("role", "")
         c = m.get("content", "")
         if isinstance(c, str):
@@ -192,6 +296,10 @@ def compress_messages(messages, level="cheap"):
                         t = json_crush(t)
                     if len(t) > 200:
                         t = compress_log(t)
+                    if len(t) > 500:
+                        t = _rtk_compress(t)
+                    if len(t) > 200:
+                        t = cache_align(t)
                     if len(t) > mult_cap:
                         t = t[:int(mult_cap * 0.6)] + "\n... truncated (%d chars)" % (len(t) - int(mult_cap * 0.6))
                     parts.append({"type": "text", "text": t})

@@ -366,7 +366,7 @@ Run the hermetic integration test to measure the exact request body received by 
 python proxy_self_test.py
 ```
 
-It uses no API key and makes no external requests. It verifies that a compressible request is reduced, that oversized conversations are left unchanged by the safety bypass, and that the FROST safety gate is present in the generated proxy. Provider billing still needs to be checked against that provider's own usage data.
+It uses no API key and makes no external requests. It verifies that a compressible request is reduced, that oversized conversations use the sliding window (recent 15 messages on normal caps, older ones on tightest caps, message count preserved), and that the FROST safety gate is present in the generated proxy. Provider billing still needs to be checked against that provider's own usage data.
 
 Codex in VS Code uses the OpenAI Responses API. Start the proxy in generic OpenAI mode, then add this to the active Codex `config.toml` (global or trusted-project `.codex/config.toml`) and restart VS Code:
 
